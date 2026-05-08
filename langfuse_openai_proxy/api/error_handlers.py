@@ -38,3 +38,9 @@ def register_error_handlers(app) -> None:
         return JSONResponse(
             status_code=400, content={"error": {"message": exc.message}}
         )
+
+    @app.exception_handler(ValueError)
+    async def validation_error_handler(request: Request, exc: ValueError):
+        return JSONResponse(
+            status_code=400, content={"error": {"message": str(exc)}}
+        )
