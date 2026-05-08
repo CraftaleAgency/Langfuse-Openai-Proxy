@@ -1,0 +1,32 @@
+services:
+  langfuse-proxy:
+    build: .
+    container_name: langfuse-proxy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${PROXY_MEMORY_LIMIT:-512M}
+    ports:
+      - "${PROXY_PORT:-8010}:8000"
+    expose:
+      - "8000"
+    environment:
+      - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:-http://localhost:4000/v1}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
+      - LANGFUSE_DEFAULT_HOST=${LANGFUSE_DEFAULT_HOST:-https://cloud.langfuse.com}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - llmserver-ai-network
+      - dokploy-network
+
+networks:
+  llmserver-ai-network:
+    external: true
+  dokploy-network:
+    external: true
