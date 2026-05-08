@@ -116,9 +116,7 @@ async def chat_completions(
     stream = body.get("stream", False)
 
     # Extract extra params (everything except model, messages, stream)
-    extra_params = {
-        k: v for k, v in body.items() if k not in ("model", "messages", "stream")
-    }
+    extra_params = {k: v for k, v in body.items() if k not in ("model", "messages", "stream")}
 
     chat_request = ChatRequest(
         model=model, messages=messages, stream=stream, extra_params=extra_params

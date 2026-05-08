@@ -33,9 +33,7 @@ def validate_langfuse_host(host: str, allowed_hosts: list[str] | None = None) ->
 
     # Must use HTTPS
     if parsed.scheme != "https":
-        raise ValueError(
-            f"Invalid Langfuse host: must use HTTPS, got '{parsed.scheme}'"
-        )
+        raise ValueError(f"Invalid Langfuse host: must use HTTPS, got '{parsed.scheme}'")
 
     # Must have a hostname
     if not parsed.hostname:
@@ -46,9 +44,7 @@ def validate_langfuse_host(host: str, allowed_hosts: list[str] | None = None) ->
     # Reject IP addresses (prevents SSRF to internal IPs)
     try:
         ipaddress.ip_address(hostname)
-        raise ValueError(
-            "Invalid Langfuse host: direct IP addresses are not allowed"
-        )
+        raise ValueError("Invalid Langfuse host: direct IP addresses are not allowed")
     except ValueError as e:
         # If this is our own "not allowed" error, re-raise it
         if "direct IP addresses" in str(e):
@@ -57,8 +53,7 @@ def validate_langfuse_host(host: str, allowed_hosts: list[str] | None = None) ->
 
     # Must match allowed hosts (exact match or subdomain)
     if not any(
-        hostname == allowed or hostname.endswith("." + allowed)
-        for allowed in allowed_hosts
+        hostname == allowed or hostname.endswith("." + allowed) for allowed in allowed_hosts
     ):
         raise ValueError(
             f"Invalid Langfuse host: '{hostname}' is not in the allowed list. "
