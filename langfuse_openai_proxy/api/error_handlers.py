@@ -14,9 +14,7 @@ def register_error_handlers(app) -> None:
     """Register domain error handlers with the FastAPI app."""
 
     @app.exception_handler(MissingCredentialsError)
-    async def missing_credentials_handler(
-        request: Request, exc: MissingCredentialsError
-    ):
+    async def missing_credentials_handler(request: Request, exc: MissingCredentialsError):
         return JSONResponse(
             status_code=401,
             content={
@@ -39,12 +37,8 @@ def register_error_handlers(app) -> None:
 
     @app.exception_handler(ProxyError)
     async def proxy_error_handler(request: Request, exc: ProxyError):
-        return JSONResponse(
-            status_code=400, content={"error": {"message": exc.message}}
-        )
+        return JSONResponse(status_code=400, content={"error": {"message": exc.message}})
 
     @app.exception_handler(ValueError)
     async def validation_error_handler(request: Request, exc: ValueError):
-        return JSONResponse(
-            status_code=400, content={"error": {"message": str(exc)}}
-        )
+        return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
