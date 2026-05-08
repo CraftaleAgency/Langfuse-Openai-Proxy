@@ -13,7 +13,10 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(
         title="Langfuse OpenAI Proxy",
-        description="OpenAI-compatible proxy with Langfuse tracing. Supports per-request project tracing via API keys.",
+        description=(
+            "OpenAI-compatible proxy with Langfuse tracing."
+            " Supports per-request project tracing via API keys."
+        ),
     )
     app.include_router(router)
     register_error_handlers(app)

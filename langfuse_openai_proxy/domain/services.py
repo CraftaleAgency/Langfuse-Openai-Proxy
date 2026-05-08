@@ -7,9 +7,8 @@ The returned LangfuseGeneration object uses:
 """
 
 import asyncio
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
-from langfuse import Langfuse
 from openai import AsyncOpenAI
 
 from .models import ChatRequest, Credentials, EmbeddingRequest

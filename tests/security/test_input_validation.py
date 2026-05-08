@@ -6,7 +6,6 @@ Integration tests verify against a real deployed proxy with real LLM backend.
 
 import pytest
 
-
 # === UNIT TESTS (no backend needed) ===
 
 
@@ -94,7 +93,11 @@ class TestInputValidationIntegration:
             headers=integration_headers,
             content=b"not json",
         )
-        assert r.status_code in (400, 422, 500)  # 500 if proxy can't parse(self, proxy, integration_headers):
+        # 500 if proxy can't parse
+        assert r.status_code in (400, 422, 500)
+
+    @pytest.mark.asyncio
+    async def test_empty_messages(self, proxy, integration_headers):
         r = await proxy.post(
             "/v1/chat/completions",
             headers=integration_headers,
