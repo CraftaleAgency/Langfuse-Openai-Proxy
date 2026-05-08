@@ -11,6 +11,7 @@ from ..domain.errors import MissingCredentialsError
 from ..domain.models import ChatRequest, Credentials, EmbeddingRequest
 from ..domain.services import TracingService
 from ..infrastructure.config import Settings
+from ..infrastructure.host_validation import validate_langfuse_host
 from ..infrastructure.openai_client import create_openai_client, get_http_client
 from .dependencies import get_settings, get_tracing_service
 
@@ -53,16 +54,27 @@ async def health():
 
 
 @router.get("/v1/models")
-async def list_models(settings: Settings = Depends(get_settings)):
-    """Proxy model list from upstream."""
+async def list_models(
+    authorization: str | None = Header(None),
+    x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
+    settings: Settings = Depends(get_settings),
+):
+    """Proxy model list from upstream. Requires authentication."""
+    parse_credentials(authorization, x_langfuse_public_key)
     openai = create_openai_client(settings.upstream_base_url, settings.upstream_api_key)
     models = await openai.models.list()
     return models.model_dump()
 
 
 @router.get("/v1/models/{model}")
-async def get_model(model: str, settings: Settings = Depends(get_settings)):
-    """Proxy single model info from upstream, with list fallback."""
+async def get_model(
+    model: str,
+    authorization: str | None = Header(None),
+    x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
+    settings: Settings = Depends(get_settings),
+):
+    """Proxy single model info from upstream, with list fallback. Requires authentication."""
+    parse_credentials(authorization, x_langfuse_public_key)
     openai = create_openai_client(settings.upstream_base_url, settings.upstream_api_key)
 
     # Try direct lookup first
@@ -92,7 +104,9 @@ async def chat_completions(
 ):
     """Proxy chat completions with Langfuse tracing."""
     credentials = parse_credentials(authorization, x_langfuse_public_key)
-    host = x_langfuse_host or settings.langfuse_default_host
+    raw_host = x_langfuse_host or settings.langfuse_default_host
+    # Security: validate user-supplied host to prevent SSRF / credential exfiltration
+    host = validate_langfuse_host(raw_host) if x_langfuse_host else raw_host
 
     body = await request.json()
     model = body.get("model", "")
@@ -129,7 +143,9 @@ async def embeddings(
 ):
     """Proxy embeddings with Langfuse tracing."""
     credentials = parse_credentials(authorization, x_langfuse_public_key)
-    host = x_langfuse_host or settings.langfuse_default_host
+    raw_host = x_langfuse_host or settings.langfuse_default_host
+    # Security: validate user-supplied host to prevent SSRF / credential exfiltration
+    host = validate_langfuse_host(raw_host) if x_langfuse_host else raw_host
 
     body = await request.json()
 
@@ -147,9 +163,26 @@ async def embeddings(
 async def proxy_passthrough(
     path: str,
     request: Request,
+    authorization: str | None = Header(None),
+    x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
     settings: Settings = Depends(get_settings),
 ):
-    """Generic passthrough for any /v1/* endpoint not explicitly handled."""
+    """Generic passthrough for any /v1/* endpoint not explicitly handled.
+
+    Requires authentication to prevent unauthenticated SSRF.
+    Rejects path traversal sequences for defense in depth.
+    """
+    # Security: require authentication on all passthrough requests
+    parse_credentials(authorization, x_langfuse_public_key)
+
+    # Security: reject path traversal sequences
+    if ".." in path or "//" in path:
+        return Response(
+            content='{"error":{"message":"Invalid path"}}',
+            status_code=400,
+            media_type="application/json",
+        )
+
     http = get_http_client()
     upstream_url = f"{settings.upstream_base_url}/{path}"
     if request.url.query:
