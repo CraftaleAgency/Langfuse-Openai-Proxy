@@ -6,11 +6,10 @@ Integration tests use PROXY_URL from env to hit a real deployment.
 
 import os
 
-import pytest
 import httpx
+import pytest
 
 from langfuse_openai_proxy.api.app import create_app
-
 
 # --- Unit test fixtures (in-process, no network) ---
 

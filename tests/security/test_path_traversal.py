@@ -10,7 +10,6 @@ tested in integration tests where raw HTTP is used.
 
 import pytest
 
-
 # === UNIT TESTS ===
 
 

@@ -21,7 +21,11 @@ def register_error_handlers(app) -> None:
             status_code=401,
             content={
                 "error": {
-                    "message": "Missing Langfuse credentials. Provide Authorization header (secret key) and X-Langfuse-Public-Key header."
+                    "message": (
+                        "Missing Langfuse credentials."
+                        " Provide Authorization header (secret key)"
+                        " and X-Langfuse-Public-Key header."
+                    )
                 }
             },
         )

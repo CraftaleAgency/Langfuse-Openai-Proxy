@@ -41,7 +41,9 @@ def parse_credentials(
 
     if not secret_key or not public_key:
         raise MissingCredentialsError(
-            "Missing Langfuse credentials. Provide Authorization header (secret key) and X-Langfuse-Public-Key header."
+            "Missing Langfuse credentials."
+            " Provide Authorization header (secret key)"
+            " and X-Langfuse-Public-Key header."
         )
 
     return Credentials(public_key=public_key, secret_key=secret_key)
