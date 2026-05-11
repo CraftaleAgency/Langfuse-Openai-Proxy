@@ -39,7 +39,7 @@ def auth_headers():
 
 # --- Integration test config (from env vars, skipped if missing) ---
 
-PROXY_URL = os.environ.get("PROXY_URL")  # e.g. https://openai.pezserv.org
+PROXY_URL = os.environ.get("PROXY_URL")  # e.g. https://openai.assistai.it
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 
