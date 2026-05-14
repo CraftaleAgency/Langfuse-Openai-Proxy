@@ -49,3 +49,22 @@ def test_pipe_takes_precedence_over_separate_header():
     creds = parse_credentials("Bearer pk-combined|sk-combined", "pk-separate")
     assert creds.public_key == "pk-combined"
     assert creds.secret_key == "sk-combined"
+
+
+def test_comma_format_splits_correctly():
+    creds = parse_credentials("Bearer pk-lf-abc,sk-lf-xyz", None)
+    assert creds.public_key == "pk-lf-abc"
+    assert creds.secret_key == "sk-lf-xyz"
+
+
+def test_comma_format_strips_whitespace():
+    creds = parse_credentials("Bearer  pk-lf-abc , sk-lf-xyz ", None)
+    assert creds.public_key == "pk-lf-abc"
+    assert creds.secret_key == "sk-lf-xyz"
+
+
+def test_pipe_takes_precedence_over_comma():
+    """Pipe separator should win over comma when both are present."""
+    creds = parse_credentials("Bearer pk-pipe|sk-pipe,pk-comma", None)
+    assert creds.public_key == "pk-pipe"
+    assert creds.secret_key == "sk-pipe,pk-comma"

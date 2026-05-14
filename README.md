@@ -9,7 +9,7 @@ An OpenAI-compatible proxy that adds **per-request Langfuse tracing** to any LLM
 ## Features
 
 - **Per-request project tracing** -- Each request carries its own Langfuse API key pair, routing traces to the correct project automatically
-- **Two credential formats** -- Combined (`pk-lf-...|sk-lf-...`) or separate headers (`Authorization` + `X-Langfuse-Public-Key`)
+- **Two credential formats** -- Combined (`pk-lf-...|sk-lf-...` or `pk-lf-...,sk-lf-...`) or separate headers (`Authorization` + `X-Langfuse-Public-Key`)
 - **Full OpenAI API compatibility** -- Chat completions, embeddings, model listing, and generic `/v1/*` passthrough
 - **SSE streaming support** -- Streaming responses are traced with content collection
 - **Clean layered architecture** -- API, Domain, and Infrastructure layers with clear separation
@@ -54,12 +54,16 @@ Point any OpenAI SDK at the proxy and add Langfuse credentials:
 
 ### Combined format (single header)
 
+Use `|` (pipe) or `,` (comma) to separate the keys:
+
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Authorization: Bearer pk-lf-...|sk-lf-..." \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+> **Cloudflare / WAF note:** If your proxy sits behind Cloudflare, the `|` character may be blocked by WAF rules. Use `,` instead: `pk-lf-...,sk-lf-...`
 
 ### Separate headers
 
@@ -78,7 +82,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="pk-lf-...|sk-lf-...",  # Combined format
+    api_key="pk-lf-...|sk-lf-...",  # Combined format (use ',' behind Cloudflare)
 )
 
 response = client.chat.completions.create(
