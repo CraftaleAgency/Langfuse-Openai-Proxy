@@ -65,6 +65,13 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 > **Cloudflare / WAF note:** If your proxy sits behind Cloudflare, the `|` character may be blocked by WAF rules. Use `,` instead: `pk-lf-...,sk-lf-...`
 
+### Query parameter (for tools with limited config)
+
+If your tool only has API Base URL and API Key fields (e.g., Onyx), pass the public key as a query parameter:
+
+- **API Base URL:** `http://localhost:8000/v1?langfuse_pk=pk-lf-...`
+- **API Key:** `sk-lf-...`
+
 ### Separate headers
 
 ```bash
