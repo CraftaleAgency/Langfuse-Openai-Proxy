@@ -18,6 +18,24 @@ from .dependencies import get_settings, get_tracing_service
 router = APIRouter()
 
 
+def _extract_by_prefix(raw: str) -> Credentials | None:
+    """Extract keys by finding pk-lf- and sk-lf- prefixes in a concatenated string."""
+    pk_start = raw.find("pk-lf-")
+    sk_start = raw.find("sk-lf-")
+    if pk_start == -1 or sk_start == -1:
+        return None
+
+    # Determine which comes first and extract accordingly
+    if pk_start < sk_start:
+        public_key = raw[pk_start:sk_start].strip()
+        secret_key = raw[sk_start:].strip()
+    else:
+        secret_key = raw[sk_start:pk_start].strip()
+        public_key = raw[pk_start:].strip()
+
+    return Credentials(public_key=public_key, secret_key=secret_key)
+
+
 def parse_credentials(
     authorization: str | None,
     x_langfuse_public_key: str | None,
@@ -25,9 +43,9 @@ def parse_credentials(
 ) -> Credentials:
     """Extract Langfuse public_key and secret_key from request headers.
 
-    Supports three formats:
-      - Combined: Authorization: Bearer <public_key>|<secret_key>
-      - Comma: Authorization: Bearer <public_key>,<secret_key>
+    Supports multiple formats:
+      - Separated: Authorization: Bearer <public_key>|<secret_key> (also , or :)
+      - Concatenated: Authorization: Bearer pk-lf-...sk-lf-... (prefix detection)
       - Separate: Authorization: Bearer <secret_key> + X-Langfuse-Public-Key header
       - Query param: Authorization: Bearer <secret_key> + ?langfuse_pk=<public_key>
 
@@ -46,6 +64,11 @@ def parse_credentials(
     if ":" in raw:
         public_key, secret_key = raw.split(":", 1)
         return Credentials(public_key=public_key.strip(), secret_key=secret_key.strip())
+
+    # Try prefix-based extraction (e.g., pk-lf-abc...sk-lf-xyz)
+    creds = _extract_by_prefix(raw)
+    if creds:
+        return creds
 
     secret_key = raw
     public_key = (x_langfuse_public_key or query_public_key or "").strip()
