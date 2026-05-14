@@ -21,12 +21,15 @@ router = APIRouter()
 def parse_credentials(
     authorization: str | None,
     x_langfuse_public_key: str | None,
+    query_public_key: str | None = None,
 ) -> Credentials:
     """Extract Langfuse public_key and secret_key from request headers.
 
-    Supports two formats:
+    Supports three formats:
       - Combined: Authorization: Bearer <public_key>|<secret_key>
+      - Comma: Authorization: Bearer <public_key>,<secret_key>
       - Separate: Authorization: Bearer <secret_key> + X-Langfuse-Public-Key header
+      - Query param: Authorization: Bearer <secret_key> + ?langfuse_pk=<public_key>
 
     Raises:
         MissingCredentialsError: If credentials are missing or incomplete
@@ -41,7 +44,7 @@ def parse_credentials(
         return Credentials(public_key=public_key.strip(), secret_key=secret_key.strip())
 
     secret_key = raw
-    public_key = (x_langfuse_public_key or "").strip()
+    public_key = (x_langfuse_public_key or query_public_key or "").strip()
 
     if not secret_key or not public_key:
         raise MissingCredentialsError(
@@ -61,12 +64,13 @@ async def health():
 
 @router.get("/v1/models")
 async def list_models(
+    request: Request,
     authorization: str | None = Header(None),
     x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
     settings: Settings = Depends(get_settings),
 ):
     """Proxy model list from upstream. Requires authentication."""
-    parse_credentials(authorization, x_langfuse_public_key)
+    parse_credentials(authorization, x_langfuse_public_key, request.query_params.get("langfuse_pk"))
     openai = create_openai_client(settings.upstream_base_url, settings.upstream_api_key)
     models = await openai.models.list()
     return models.model_dump()
@@ -75,12 +79,13 @@ async def list_models(
 @router.get("/v1/models/{model}")
 async def get_model(
     model: str,
+    request: Request,
     authorization: str | None = Header(None),
     x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
     settings: Settings = Depends(get_settings),
 ):
     """Proxy single model info from upstream, with list fallback. Requires authentication."""
-    parse_credentials(authorization, x_langfuse_public_key)
+    parse_credentials(authorization, x_langfuse_public_key, request.query_params.get("langfuse_pk"))
     openai = create_openai_client(settings.upstream_base_url, settings.upstream_api_key)
 
     # Try direct lookup first
@@ -109,7 +114,8 @@ async def chat_completions(
     settings: Settings = Depends(get_settings),
 ):
     """Proxy chat completions with Langfuse tracing."""
-    credentials = parse_credentials(authorization, x_langfuse_public_key)
+    langfuse_pk = request.query_params.get("langfuse_pk")
+    credentials = parse_credentials(authorization, x_langfuse_public_key, langfuse_pk)
     raw_host = x_langfuse_host or settings.langfuse_default_host
     # Security: validate user-supplied host to prevent SSRF / credential exfiltration
     host = validate_langfuse_host(raw_host) if x_langfuse_host else raw_host
@@ -146,7 +152,8 @@ async def embeddings(
     settings: Settings = Depends(get_settings),
 ):
     """Proxy embeddings with Langfuse tracing."""
-    credentials = parse_credentials(authorization, x_langfuse_public_key)
+    langfuse_pk = request.query_params.get("langfuse_pk")
+    credentials = parse_credentials(authorization, x_langfuse_public_key, langfuse_pk)
     raw_host = x_langfuse_host or settings.langfuse_default_host
     # Security: validate user-supplied host to prevent SSRF / credential exfiltration
     host = validate_langfuse_host(raw_host) if x_langfuse_host else raw_host
@@ -177,7 +184,7 @@ async def proxy_passthrough(
     Rejects path traversal sequences for defense in depth.
     """
     # Security: require authentication on all passthrough requests
-    parse_credentials(authorization, x_langfuse_public_key)
+    parse_credentials(authorization, x_langfuse_public_key, request.query_params.get("langfuse_pk"))
 
     # Security: reject path traversal sequences
     if ".." in path or "//" in path:

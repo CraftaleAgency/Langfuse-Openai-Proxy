@@ -68,3 +68,16 @@ def test_pipe_takes_precedence_over_comma():
     creds = parse_credentials("Bearer pk-pipe|sk-pipe,pk-comma", None)
     assert creds.public_key == "pk-pipe"
     assert creds.secret_key == "sk-pipe,pk-comma"
+
+
+def test_query_param_public_key():
+    creds = parse_credentials("Bearer sk-lf-xyz", None, query_public_key="pk-lf-abc")
+    assert creds.public_key == "pk-lf-abc"
+    assert creds.secret_key == "sk-lf-xyz"
+
+
+def test_header_takes_precedence_over_query_param():
+    creds = parse_credentials(
+        "Bearer sk-lf-xyz", "pk-from-header", query_public_key="pk-from-query"
+    )
+    assert creds.public_key == "pk-from-header"
