@@ -43,6 +43,10 @@ def parse_credentials(
         public_key, secret_key = raw.split(",", 1)
         return Credentials(public_key=public_key.strip(), secret_key=secret_key.strip())
 
+    if ":" in raw:
+        public_key, secret_key = raw.split(":", 1)
+        return Credentials(public_key=public_key.strip(), secret_key=secret_key.strip())
+
     secret_key = raw
     public_key = (x_langfuse_public_key or query_public_key or "").strip()
 
