@@ -81,3 +81,15 @@ def test_header_takes_precedence_over_query_param():
         "Bearer sk-lf-xyz", "pk-from-header", query_public_key="pk-from-query"
     )
     assert creds.public_key == "pk-from-header"
+
+
+def test_concatenated_pk_first():
+    creds = parse_credentials("Bearer pk-lf-abc123sk-lf-xyz456", None)
+    assert creds.public_key == "pk-lf-abc123"
+    assert creds.secret_key == "sk-lf-xyz456"
+
+
+def test_concatenated_sk_first():
+    creds = parse_credentials("Bearer sk-lf-xyz456pk-lf-abc123", None)
+    assert creds.public_key == "pk-lf-abc123"
+    assert creds.secret_key == "sk-lf-xyz456"
