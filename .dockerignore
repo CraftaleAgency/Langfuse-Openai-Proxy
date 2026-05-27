@@ -1,0 +1,14 @@
+.git
+.github
+.env
+.env.*
+__pycache__
+*.pyc
+*.pyo
+tests
+*.md
+!README.md
+ruff.toml
+.dockerignore
+Dockerfile
+docker-compose.yml

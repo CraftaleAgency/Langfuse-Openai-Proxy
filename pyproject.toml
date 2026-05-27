@@ -25,6 +25,12 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/CraftaleAgency/Langfuse-Openai-Proxy"
+Repository = "https://github.com/CraftaleAgency/Langfuse-Openai-Proxy"
+Issues = "https://github.com/CraftaleAgency/Langfuse-Openai-Proxy/issues"
+
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",

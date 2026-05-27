@@ -21,12 +21,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    networks:
-      - llmserver-ai-network
-      - dokploy-network
-
-networks:
-  llmserver-ai-network:
-    external: true
-  dokploy-network:
-    external: true
+    # Uncomment and adjust if you need to join external Docker networks
+    # networks:
+    #   - your-network
