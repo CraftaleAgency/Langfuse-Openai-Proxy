@@ -7,11 +7,41 @@ The returned LangfuseGeneration object uses:
 """
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 
 from openai import AsyncOpenAI
 
-from .models import ChatRequest, Credentials, EmbeddingRequest
+from ..infrastructure.openai_client import get_http_client
+from .models import ChatRequest, Credentials, EmbeddingRequest, ResponsesRequest
+
+
+def _extract_input_text(input_data: str | list[dict]) -> str:
+    """Extract readable text from Responses API input for Langfuse tracing."""
+    if isinstance(input_data, str):
+        return input_data
+    texts = []
+    for item in input_data:
+        if isinstance(item, dict):
+            content = item.get("content")
+            if isinstance(content, str):
+                texts.append(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in ("input_text", "text"):
+                        texts.append(part.get("text", ""))
+    return " ".join(texts)
+
+
+def _extract_output_text(response_data: dict) -> str:
+    """Extract readable text from Responses API output for Langfuse tracing."""
+    texts = []
+    for item in response_data.get("output", []):
+        if item.get("type") == "message":
+            for content in item.get("content", []):
+                if content.get("type") in ("output_text", "text"):
+                    texts.append(content.get("text", ""))
+    return " ".join(texts)
 
 
 class TracingService:
@@ -25,9 +55,13 @@ class TracingService:
         self,
         langfuse_client_factory: type,
         openai_client: AsyncOpenAI,
+        upstream_base_url: str,
+        upstream_api_key: str,
     ):
         self._create_langfuse = langfuse_client_factory
         self._openai = openai_client
+        self._upstream_base_url = upstream_base_url
+        self._upstream_api_key = upstream_api_key
 
     async def chat_completion(
         self,
@@ -172,3 +206,129 @@ class TracingService:
             await asyncio.to_thread(lf.flush)
 
         return response.model_dump()
+
+    async def response(
+        self,
+        credentials: Credentials,
+        request: ResponsesRequest,
+        host: str,
+    ) -> tuple[dict, int]:
+        """Execute non-streaming Responses API call with Langfuse tracing."""
+        lf = self._create_langfuse(
+            credentials.public_key,
+            credentials.secret_key,
+            host,
+        )
+
+        generation = lf.start_observation(
+            name="response",
+            as_type="generation",
+            model=request.model,
+            input=_extract_input_text(request.input),
+            metadata={"stream": False},
+        )
+
+        try:
+            http = get_http_client()
+            url = f"{self._upstream_base_url}/responses"
+            headers = {"Content-Type": "application/json"}
+            if self._upstream_api_key:
+                headers["Authorization"] = f"Bearer {self._upstream_api_key}"
+            body = {"model": request.model, "input": request.input}
+            if request.extra_params:
+                body.update(request.extra_params)
+
+            resp = await http.post(url, headers=headers, json=body, timeout=120)
+            response_data = resp.json()
+
+            usage = response_data.get("usage", {})
+            generation.update(
+                output=_extract_output_text(response_data),
+                usage_details={
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            )
+            generation.end()
+        except Exception as e:
+            generation.update(level="ERROR", status_message=str(e))
+            generation.end()
+            raise
+        finally:
+            await asyncio.to_thread(lf.flush)
+
+        return response_data, resp.status_code
+
+    async def stream_response(
+        self,
+        credentials: Credentials,
+        request: ResponsesRequest,
+        host: str,
+    ) -> AsyncGenerator[str, None]:
+        """Execute streaming Responses API call with Langfuse tracing.
+
+        Forwards raw SSE events from upstream. Collects text deltas and usage
+        from the response.completed event for Langfuse tracing.
+        """
+        lf = self._create_langfuse(
+            credentials.public_key,
+            credentials.secret_key,
+            host,
+        )
+
+        generation = lf.start_observation(
+            name="response",
+            as_type="generation",
+            model=request.model,
+            input=_extract_input_text(request.input),
+            metadata={"stream": True},
+        )
+
+        collected_deltas = []
+        usage_data = {}
+
+        try:
+            http = get_http_client()
+            url = f"{self._upstream_base_url}/responses"
+            headers = {"Content-Type": "application/json"}
+            if self._upstream_api_key:
+                headers["Authorization"] = f"Bearer {self._upstream_api_key}"
+            body = {"model": request.model, "input": request.input, "stream": True}
+            if request.extra_params:
+                body.update(request.extra_params)
+
+            buffer = ""
+            async with http.stream("POST", url, headers=headers, json=body, timeout=120) as resp:
+                async for chunk in resp.aiter_text():
+                    yield chunk
+                    buffer += chunk
+                    while "\n\n" in buffer:
+                        event_text, buffer = buffer.split("\n\n", 1)
+                        for line in event_text.split("\n"):
+                            if line.startswith("data: "):
+                                try:
+                                    data = json.loads(line[6:])
+                                    if data.get("type") == "response.output_text.delta":
+                                        collected_deltas.append(data.get("delta", ""))
+                                    elif data.get("type") == "response.completed":
+                                        response_obj = data.get("response", {})
+                                        usage_data = response_obj.get("usage", {})
+                                except json.JSONDecodeError:
+                                    pass
+
+            generation.update(
+                output="".join(collected_deltas),
+                usage_details={
+                    "input_tokens": usage_data.get("input_tokens", 0),
+                    "output_tokens": usage_data.get("output_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                },
+            )
+            generation.end()
+        except Exception as e:
+            generation.update(level="ERROR", status_message=str(e))
+            generation.end()
+            raise
+        finally:
+            await asyncio.to_thread(lf.flush)

@@ -25,4 +25,6 @@ def get_tracing_service(settings: Settings = Depends(get_settings)) -> TracingSe
     return TracingService(
         langfuse_client_factory=create_langfuse_client,
         openai_client=openai,
+        upstream_base_url=settings.upstream_base_url,
+        upstream_api_key=settings.upstream_api_key,
     )

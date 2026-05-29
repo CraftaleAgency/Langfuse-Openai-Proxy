@@ -4,11 +4,13 @@ All endpoint definitions, credential parsing, and request/response handling.
 Delegates business logic to TracingService.
 """
 
+import json
+
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import Response, StreamingResponse
 
 from ..domain.errors import MissingCredentialsError
-from ..domain.models import ChatRequest, Credentials, EmbeddingRequest
+from ..domain.models import ChatRequest, Credentials, EmbeddingRequest, ResponsesRequest
 from ..domain.services import TracingService
 from ..infrastructure.config import Settings
 from ..infrastructure.host_validation import validate_langfuse_host
@@ -195,6 +197,46 @@ async def embeddings(
     )
 
     return await tracing_service.embedding(credentials, embedding_request, host)
+
+
+@router.post("/v1/responses")
+async def responses(
+    request: Request,
+    authorization: str | None = Header(None),
+    x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
+    x_langfuse_host: str | None = Header(None, alias="X-Langfuse-Host"),
+    tracing_service: TracingService = Depends(get_tracing_service),
+    settings: Settings = Depends(get_settings),
+):
+    """Proxy Responses API with Langfuse tracing."""
+    langfuse_pk = request.query_params.get("langfuse_pk")
+    credentials = parse_credentials(authorization, x_langfuse_public_key, langfuse_pk)
+    raw_host = x_langfuse_host or settings.langfuse_default_host
+    host = validate_langfuse_host(raw_host) if x_langfuse_host else raw_host
+
+    body = await request.json()
+    model = body.get("model", "")
+    input_data = body.get("input", "")
+    stream = body.get("stream", False)
+    extra_params = {k: v for k, v in body.items() if k not in ("model", "input", "stream")}
+
+    responses_request = ResponsesRequest(
+        model=model, input=input_data, stream=stream, extra_params=extra_params
+    )
+
+    if stream:
+        return StreamingResponse(
+            tracing_service.stream_response(credentials, responses_request, host),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    result, status_code = await tracing_service.response(credentials, responses_request, host)
+    return Response(
+        content=json.dumps(result),
+        status_code=status_code,
+        media_type="application/json",
+    )
 
 
 @router.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])

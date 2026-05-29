@@ -31,3 +31,13 @@ class EmbeddingRequest:
     model: str
     input: list | str
     extra_params: dict | None = None
+
+
+@dataclass
+class ResponsesRequest:
+    """Responses API request parameters."""
+
+    model: str
+    input: str | list[dict]
+    stream: bool = False
+    extra_params: dict | None = None
