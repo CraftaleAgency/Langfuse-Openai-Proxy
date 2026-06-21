@@ -90,7 +90,7 @@ class TracingService:
                 model=request.model,
                 messages=request.messages,
                 stream=False,
-                **kwargs,
+                extra_body=kwargs,
             )
 
             generation.update(
@@ -143,7 +143,7 @@ class TracingService:
                 model=request.model,
                 messages=request.messages,
                 stream=True,
-                **kwargs,
+                extra_body=kwargs,
             )
 
             async for chunk in stream:
