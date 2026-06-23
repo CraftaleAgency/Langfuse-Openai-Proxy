@@ -28,4 +28,5 @@ def get_tracing_service(settings: Settings = Depends(get_settings)) -> TracingSe
         upstream_base_url=settings.upstream_base_url,
         upstream_api_key=settings.upstream_api_key,
         reasoning_as_content=settings.reasoning_as_content,
+        max_tokens_floor=settings.max_tokens_floor,
     )

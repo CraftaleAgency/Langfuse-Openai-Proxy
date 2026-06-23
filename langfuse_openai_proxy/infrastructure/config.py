@@ -30,3 +30,13 @@ class Settings:
         "yes",
         "on",
     )
+    # Many OpenAI clients default to a small `max_tokens` (50 is common). Reasoning
+    # models served via Ollama (qwen3, gemma4, thinker14b) burn ~100+ tokens on
+    # `<think>...</think>` before any visible output emerges, so a 50-token budget
+    # truncates thinking mid-stream and the client sees an empty response. When
+    # set to a positive int, the proxy injects `max_tokens=floor` when the client
+    # sends none, and raises `max_tokens` to the floor when the client sends less.
+    # Leave unset (or 0) to disable — clients' own budgets are then honored.
+    max_tokens_floor: int | None = (
+        int(v) if (v := os.environ.get("MAX_TOKENS_FLOOR", "").strip()).isdigit() else None
+    )

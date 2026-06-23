@@ -7,7 +7,6 @@ The returned LangfuseGeneration object uses:
 """
 
 import asyncio
-import copy
 import json
 import time
 from collections.abc import AsyncGenerator
@@ -130,6 +129,26 @@ def _ollama_native_to_openai(model: str, resp: dict) -> dict:
     }
 
 
+def _apply_max_tokens_floor(extra_params: dict | None, floor: int | None) -> dict:
+    """Inject or raise `max_tokens` so reasoning models don't get starved.
+
+    Many OpenAI clients default to a small max_tokens (50 is common). Reasoning
+    models served via Ollama (qwen3, gemma4, thinker14b) burn ~100+ tokens on
+    `<think>...</think>` before any visible output emerges, so a 50-token budget
+    truncates thinking mid-stream and the client sees an empty response. With a
+    floor set, requests with no max_tokens get the floor, and requests with a
+    max_tokens below the floor are raised to it. Requests already at or above
+    the floor pass through untouched.
+    """
+    out = dict(extra_params) if extra_params else {}
+    if not floor or floor <= 0:
+        return out
+    current = out.get("max_tokens")
+    if current is None or (isinstance(current, int) and current < floor):
+        out["max_tokens"] = floor
+    return out
+
+
 def _ollama_native_base_url(upstream_base_url: str) -> str:
     """Strip the trailing /v1 from the upstream URL so we can hit /api/chat.
 
@@ -167,6 +186,7 @@ class TracingService:
         upstream_base_url: str,
         upstream_api_key: str,
         reasoning_as_content: bool = False,
+        max_tokens_floor: int | None = None,
     ):
         self._create_langfuse = langfuse_client_factory
         self._openai = openai_client
@@ -176,6 +196,10 @@ class TracingService:
         # that only read `content` (OpenClaw's openai-completions adapter) see the
         # model's output instead of an empty stream. See Settings.reasoning_as_content.
         self._reasoning_as_content = reasoning_as_content
+        # When set, inject/raise max_tokens on chat requests so reasoning models
+        # don't burn their entire (small) budget on hidden thinking. See
+        # Settings.max_tokens_floor.
+        self._max_tokens_floor = max_tokens_floor
 
     async def chat_completion(
         self,
@@ -184,6 +208,11 @@ class TracingService:
         host: str,
     ) -> dict:
         """Execute non-streaming chat completion with Langfuse tracing."""
+        # Apply max_tokens floor before any routing decision — both the native
+        # /api/chat path and the OpenAI-compat /v1 path read max_tokens from
+        # extra_params. See _apply_max_tokens_floor().
+        request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+
         lf = self._create_langfuse(
             credentials.public_key,
             credentials.secret_key,
@@ -355,6 +384,9 @@ class TracingService:
 
         Yields SSE-formatted chunks. Collects content for tracing after stream ends.
         """
+        # Apply max_tokens floor before any routing decision — see chat_completion().
+        request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+
         lf = self._create_langfuse(
             credentials.public_key,
             credentials.secret_key,

@@ -116,6 +116,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `UPSTREAM_API_KEY` | (empty) | API key for the upstream backend |
 | `LANGFUSE_DEFAULT_HOST` | `https://cloud.langfuse.com` | Default Langfuse host (overridable per-request via `X-Langfuse-Host`) |
 | `REASONING_AS_CONTENT` | `false` | Copy upstream `reasoning` deltas into `content`. Enable when proxying reasoning models (e.g. Ollama gemma4/qwen3) to clients that only read `content` (OpenClaw's openai-completions adapter), which otherwise see an empty stream. Keeps the `reasoning` field intact. |
+| `MAX_TOKENS_FLOOR` | (unset) | Positive int. Injects `max_tokens=floor` when a client sends none, and raises `max_tokens` to the floor when a client sends less. Reasoning models burn ~100+ tokens on hidden `<think>...</think>` before emitting visible output, so a client default of `max_tokens=50` truncates thinking mid-stream and produces an empty response. Set to e.g. `2000` to shield every client from this failure mode. |
 
 ## Architecture
 
