@@ -1,26 +1,36 @@
 services:
-  langfuse-proxy:
+  langfuse-openai-proxy:
     build: .
-    container_name: langfuse-proxy
+    container_name: langfuse-openai-proxy
     restart: unless-stopped
     deploy:
       resources:
         limits:
           memory: ${PROXY_MEMORY_LIMIT:-512M}
     ports:
-      - "${PROXY_PORT:-8010}:8000"
+      - "${PROXY_PORT:-8000}:8000"
     expose:
       - "8000"
     environment:
       - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:-http://localhost:4000/v1}
       - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:-}
       - LANGFUSE_DEFAULT_HOST=${LANGFUSE_DEFAULT_HOST:-https://cloud.langfuse.com}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_PROJECT_ID=${LANGFUSE_PROJECT_ID:-}
+      - REASONING_AS_CONTENT=${REASONING_AS_CONTENT:-false}
+      - MAX_TOKENS_FLOOR=${MAX_TOKENS_FLOOR:-}
+    networks:
+      - default
+      - dokploy-network
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-    # Uncomment and adjust if you need to join external Docker networks
-    # networks:
-    #   - your-network
+
+networks:
+  dokploy-network:
+    external: true
