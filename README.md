@@ -115,6 +115,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | `UPSTREAM_BASE_URL` | `http://localhost:4000/v1` | OpenAI-compatible backend to proxy to |
 | `UPSTREAM_API_KEY` | (empty) | API key for the upstream backend |
 | `LANGFUSE_DEFAULT_HOST` | `https://cloud.langfuse.com` | Default Langfuse host (overridable per-request via `X-Langfuse-Host`) |
+| `REASONING_AS_CONTENT` | `false` | Copy upstream `reasoning` deltas into `content`. Enable when proxying reasoning models (e.g. Ollama gemma4/qwen3) to clients that only read `content` (OpenClaw's openai-completions adapter), which otherwise see an empty stream. Keeps the `reasoning` field intact. |
 
 ## Architecture
 

@@ -27,4 +27,5 @@ def get_tracing_service(settings: Settings = Depends(get_settings)) -> TracingSe
         openai_client=openai,
         upstream_base_url=settings.upstream_base_url,
         upstream_api_key=settings.upstream_api_key,
+        reasoning_as_content=settings.reasoning_as_content,
     )

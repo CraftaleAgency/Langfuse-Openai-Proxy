@@ -57,11 +57,16 @@ class TracingService:
         openai_client: AsyncOpenAI,
         upstream_base_url: str,
         upstream_api_key: str,
+        reasoning_as_content: bool = False,
     ):
         self._create_langfuse = langfuse_client_factory
         self._openai = openai_client
         self._upstream_base_url = upstream_base_url
         self._upstream_api_key = upstream_api_key
+        # When True, copy upstream `reasoning` deltas into `content` so clients
+        # that only read `content` (OpenClaw's openai-completions adapter) see the
+        # model's output instead of an empty stream. See Settings.reasoning_as_content.
+        self._reasoning_as_content = reasoning_as_content
 
     async def chat_completion(
         self,
@@ -109,7 +114,19 @@ class TracingService:
         finally:
             await asyncio.to_thread(lf.flush)
 
-        return response.model_dump()
+        data = response.model_dump()
+
+        # Non-stream remap: same reasoning → content fallback as the streaming
+        # path, for clients that only read `message.content`.
+        if self._reasoning_as_content:
+            for choice in data.get("choices", []):
+                message = choice.get("message")
+                if isinstance(message, dict) and not message.get("content"):
+                    reasoning = message.get("reasoning")
+                    if reasoning:
+                        message["content"] = reasoning
+
+        return data
 
     async def stream_chat_completion(
         self,
@@ -147,10 +164,26 @@ class TracingService:
             )
 
             async for chunk in stream:
-                data = chunk.model_dump_json()
-                yield f"data: {data}\n\n"
+                data = json.loads(chunk.model_dump_json())
 
-                # Collect content for tracing
+                # Remap reasoning → content for clients that only read `content`.
+                # Ollama's /v1 endpoint streams reasoning-model output in
+                # `delta.reasoning` with `delta.content` empty; without this,
+                # such clients see an empty stream and abort (stop_reason=length).
+                if self._reasoning_as_content and data.get("choices"):
+                    for choice in data["choices"]:
+                        delta = choice.get("delta")
+                        if not isinstance(delta, dict):
+                            continue
+                        reasoning = delta.get("reasoning")
+                        if reasoning and not delta.get("content"):
+                            delta["content"] = reasoning
+                            # Reflect the remapped text in tracing too.
+                            collected_content.append(reasoning)
+
+                yield f"data: {json.dumps(data)}\n\n"
+
+                # Collect content for tracing (native content, not already captured above)
                 if chunk.choices and chunk.choices[0].delta.content:
                     collected_content.append(chunk.choices[0].delta.content)
 
