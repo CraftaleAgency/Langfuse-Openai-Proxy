@@ -54,6 +54,22 @@ class FakeTracingService:
     ) -> dict[str, Any]:
         self.captured_requests.append(request)
         self.captured_apply_floor.append(apply_max_tokens_floor)
+        if self.behavior == "thinking":
+            # Thinking-model non-streaming response: reasoning separated from content.
+            return {
+                "id": "chatcmpl-think",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "reasoning": "Let me consider the greeting.",
+                            "content": "Hi there",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 9, "total_tokens": 14},
+            }
         if self.behavior == "tool_use":
             return {
                 "id": "chatcmpl-test",
@@ -99,7 +115,20 @@ class FakeTracingService:
     ) -> AsyncIterator[str]:
         self.captured_requests.append(request)
         self.captured_apply_floor.append(apply_max_tokens_floor)
-        if self.behavior == "stream_tool_use":
+        if self.behavior == "stream_thinking":
+            # Ollama thinking-model stream: reasoning phase (delta.reasoning)
+            # then content phase (delta.content).
+            chunks = [
+                {"choices": [{"delta": {"reasoning": "Thinking"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"reasoning": "..."}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": "Hi"}, "finish_reason": None}]},
+                {"choices": [{"delta": {"content": " there"}, "finish_reason": None}]},
+                {
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
+                },
+            ]
+        elif self.behavior == "stream_tool_use":
             chunks = [
                 {
                     "choices": [
@@ -730,5 +759,116 @@ async def test_streaming_max_tokens_not_floored(client_factory):
         assert resp.status_code == 200
         assert captured[0].captured_apply_floor == [False]
         assert captured[0].captured_requests[0].extra_params.get("max_tokens") == 50
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_emits_thinking_block(client_factory):
+    """A thinking-model response (message.reasoning) yields a thinking block first."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="thinking")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        blocks = body["content"]
+        # thinking block must precede the text block.
+        assert blocks[0]["type"] == "thinking"
+        assert blocks[0]["thinking"] == "Let me consider the greeting."
+        # signature is required to be present (synthetic, not validated).
+        assert blocks[0]["signature"]
+        assert blocks[1]["type"] == "text"
+        assert blocks[1]["text"] == "Hi there"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_thinking_block_closes_before_text(client_factory):
+    """delta.reasoning → thinking block; must fully close before the text block opens.
+
+    This locks in the Anthropic ordering invariant: signature_delta +
+    content_block_stop for the thinking block precede content_block_start for
+    the text block. Getting this wrong makes Claude Code discard the response.
+    """
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="stream_thinking")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        events = await _read_sse_stream(resp)
+
+        # The thinking block opens at index 0.
+        think_start = [
+            e
+            for et, e in events
+            if et == "content_block_start" and e["content_block"]["type"] == "thinking"
+        ]
+        assert len(think_start) == 1
+        assert think_start[0]["index"] == 0
+
+        # thinking_delta events carry the reasoning text in arrival order.
+        think_deltas = [
+            e["delta"]["thinking"]
+            for et, e in events
+            if et == "content_block_delta" and e["delta"].get("type") == "thinking_delta"
+        ]
+        assert "".join(think_deltas) == "Thinking..."
+
+        # A signature_delta must precede the thinking block's content_block_stop.
+        event_types = [et for et, _ in events]
+        think_stop_idx = next(
+            i for i, (et, e) in enumerate(events) if et == "content_block_stop" and e["index"] == 0
+        )
+        sig_idx = next(
+            i
+            for i, (et, e) in enumerate(events[:think_stop_idx])
+            if et == "content_block_delta"
+            and e["delta"].get("type") == "signature_delta"
+            and e["index"] == 0
+        )
+        assert sig_idx < think_stop_idx
+
+        # The text block must open AFTER the thinking block is fully closed.
+        text_start_idx = next(
+            i
+            for i, (et, e) in enumerate(events)
+            if et == "content_block_start" and e["content_block"]["type"] == "text"
+        )
+        assert text_start_idx > think_stop_idx
+
+        # And the text deltas reconstruct the content.
+        text_deltas = [
+            e["delta"]["text"]
+            for et, e in events
+            if et == "content_block_delta" and e["delta"].get("type") == "text_delta"
+        ]
+        assert "".join(text_deltas) == "Hi there"
+
+        # usage from the final chunk flows through to message_delta.
+        md = [e for et, e in events if et == "message_delta"][0]
+        assert md["usage"]["output_tokens"] == 6
+        assert md["delta"]["stop_reason"] == "end_turn"
+        # Sanity: full event type sequence is well-formed.
+        assert event_types[0] == "message_start"
+        assert event_types[-1] == "message_stop"
     finally:
         await client.aclose()

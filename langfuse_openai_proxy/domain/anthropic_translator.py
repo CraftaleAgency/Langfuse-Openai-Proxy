@@ -32,6 +32,18 @@ def _msg_id() -> str:
     return f"msg_{int(time.time() * 1000)}"
 
 
+def _thinking_signature(message_id: str, block_index: int) -> str:
+    """Synthesize an opaque signature for a thinking block.
+
+    Anthropic's real API signs thinking blocks so clients can verify provenance
+    when replaying them in later turns. We're translating from Ollama which
+    doesn't sign anything, so we emit a deterministic synthetic signature.
+    Claude Code requires the field to be present but does not validate it
+    against Anthropic-issued keys for third-party endpoints.
+    """
+    return f"{message_id}.tik.{block_index}"
+
+
 # ---------------------------------------------------------------------------
 # Request translation: Anthropic → OpenAI
 # ---------------------------------------------------------------------------
@@ -234,6 +246,21 @@ def openai_to_anthropic_response(
 
     content_blocks: list[dict[str, Any]] = []
 
+    # Ollama's OpenAI-compat endpoint exposes thinking-model reasoning under
+    # `message.reasoning` (separate from `message.content`). Claude Code, when
+    # the request enabled thinking, expects an Anthropic thinking block BEFORE
+    # any text block. We emit one whenever upstream produced reasoning, signed
+    # with a synthetic opaque signature (see _thinking_signature).
+    reasoning = message.get("reasoning") or ""
+    if reasoning:
+        content_blocks.append(
+            {
+                "type": "thinking",
+                "thinking": reasoning,
+                "signature": _thinking_signature(openai_resp.get("id") or _msg_id(), 0),
+            }
+        )
+
     text = message.get("content")
     if text:
         content_blocks.append({"type": "text", "text": text})
@@ -292,7 +319,7 @@ class _StreamState:
 
     def __init__(self) -> None:
         self.message_started = False
-        # Block index → block descriptor {"type": "text"|"tool_use", "closed": bool}
+        # Block index → block descriptor {"type": "text"|"tool_use"|"thinking", "closed": bool}
         self.open_blocks: dict[int, dict[str, Any]] = {}
         # Next content block index to assign.
         self.next_index = 0
@@ -348,6 +375,32 @@ async def openai_to_anthropic_stream(
             },
         )
 
+    def _close_open_thinking_block() -> str:
+        # Close any thinking block that's still open BEFORE opening the next
+        # block. Anthropic requires signature_delta + content_block_stop to
+        # fully close a thinking block before subsequent blocks begin. Ollama
+        # gives no explicit "reasoning phase ended" signal, so we close lazily
+        # on the first non-reasoning delta. No-op if no thinking block is open.
+        out: list[str] = []
+        for idx, blk in state.open_blocks.items():
+            if blk["type"] == "thinking" and not blk["closed"]:
+                out.append(
+                    _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": _thinking_signature(message_id, idx),
+                            },
+                        },
+                    )
+                )
+                out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": idx}))
+                blk["closed"] = True
+        return "".join(out)
+
     def _open_text_block() -> tuple[int, str] | None:
         # Reuse an existing open text block, or open a new one.
         for idx, blk in state.open_blocks.items():
@@ -357,10 +410,12 @@ async def openai_to_anthropic_stream(
             # Can't open text after tools — Anthropic expects contiguous text
             # at the start. Bail and drop the delta.
             return None
+        # First close any open thinking block (Anthropic ordering invariant).
+        prefix = _close_open_thinking_block()
         idx = state.next_index
         state.next_index += 1
         state.open_blocks[idx] = {"type": "text", "closed": False}
-        return idx, _sse(
+        return idx, prefix + _sse(
             "content_block_start",
             {
                 "type": "content_block_start",
@@ -369,10 +424,31 @@ async def openai_to_anthropic_stream(
             },
         )
 
+    def _open_thinking_block() -> tuple[int, str]:
+        # Reuse an existing open thinking block, or open a new one.
+        # Anthropic permits multiple separate thinking blocks, but Ollama emits
+        # reasoning as one contiguous phase before content — so one block is enough.
+        for idx, blk in state.open_blocks.items():
+            if blk["type"] == "thinking" and not blk["closed"]:
+                return idx, ""
+        idx = state.next_index
+        state.next_index += 1
+        state.open_blocks[idx] = {"type": "thinking", "closed": False}
+        return idx, _sse(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        )
+
     def _open_tool_block(tool_delta_index: int, tc_delta: dict[str, Any]) -> tuple[int, str]:
         buf = state.tool_buffers.get(tool_delta_index)
         if buf is not None:
             return buf["block_index"], ""
+        # First close any open thinking block (Anthropic ordering invariant).
+        prefix = _close_open_thinking_block()
         idx = state.next_index
         state.next_index += 1
         fn = tc_delta.get("function") or {}
@@ -386,7 +462,7 @@ async def openai_to_anthropic_stream(
             "id": tool_id,
             "name": tool_name,
         }
-        return idx, _sse(
+        return idx, prefix + _sse(
             "content_block_start",
             {
                 "type": "content_block_start",
@@ -432,10 +508,29 @@ async def openai_to_anthropic_stream(
         # OpenAI sometimes sends a final chunk with only usage + finish_reason
         # (stream_options.include_usage). Don't treat that as content.
         text_delta = delta.get("content")
+        reasoning_delta = delta.get("reasoning") or ""
         tool_call_deltas = delta.get("tool_calls") or []
 
-        if text_delta or tool_call_deltas:
+        if text_delta or reasoning_delta or tool_call_deltas:
             events.append(_ensure_started())
+
+        # Reasoning phase (thinking-model only): Ollama separates this from
+        # content. Emit as Anthropic thinking_delta on a thinking block.
+        # Must precede text per Anthropic spec; Ollama emits reasoning first
+        # so natural arrival order keeps this invariant.
+        if reasoning_delta:
+            idx, start_evt = _open_thinking_block()
+            events.append(start_evt)
+            events.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "thinking_delta", "thinking": reasoning_delta},
+                    },
+                )
+            )
 
         if text_delta:
             opened = _open_text_block()
@@ -495,6 +590,21 @@ async def openai_to_anthropic_stream(
     for idx in sorted(state.open_blocks.keys()):
         blk = state.open_blocks[idx]
         if not blk["closed"]:
+            # Anthropic requires thinking blocks to receive a signature_delta
+            # before the stop so clients can persist provenance. We synthesize
+            # one — see _thinking_signature.
+            if blk["type"] == "thinking":
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": _thinking_signature(message_id, idx),
+                        },
+                    },
+                )
             yield _sse("content_block_stop", {"type": "content_block_stop", "index": idx})
             blk["closed"] = True
 
