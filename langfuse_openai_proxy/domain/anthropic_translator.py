@@ -464,7 +464,12 @@ async def openai_to_anthropic_stream(
             {
                 "type": "content_block_start",
                 "index": idx,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                # NOTE: no `signature` here. Real Anthropic omits the field on
+                # content_block_start — the signature is delivered only via a
+                # later signature_delta (which we emit before content_block_stop).
+                # Including `"signature": ""` makes Claude Code's strict TS SDK
+                # reject the block, abort the stream, and auto-retry to empty.
+                "content_block": {"type": "thinking", "thinking": ""},
             },
         )
 
