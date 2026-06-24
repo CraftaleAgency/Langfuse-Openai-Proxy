@@ -66,13 +66,22 @@ def _build_tracing_service(settings: Settings) -> TracingService:
 
     Anthropic clients always send explicit max_tokens per spec, so the floor
     that protects OpenAI clients from default-50 budgets must not apply here.
+
+    reasoning_as_content is FORCED False here even if the global setting is on.
+    That remap copies delta.reasoning into delta.content for OpenAI-only clients
+    that don't read the reasoning field — but our anthropic_translator consumes
+    delta.reasoning directly to emit Anthropic thinking blocks. With the remap
+    on, every reasoning chunk carries BOTH fields and the translator emits
+    interleaved thinking+text blocks (thinking→text→thinking), violating the
+    Anthropic invariant that all thinking blocks must precede text. The
+    translator owns reasoning handling on this path.
     """
     return TracingService(
         langfuse_client_factory=create_langfuse_client,
         openai_client=create_openai_client(settings.upstream_base_url, settings.upstream_api_key),
         upstream_base_url=settings.upstream_base_url,
         upstream_api_key=settings.upstream_api_key,
-        reasoning_as_content=settings.reasoning_as_content,
+        reasoning_as_content=False,
         max_tokens_floor=None,
     )
 
