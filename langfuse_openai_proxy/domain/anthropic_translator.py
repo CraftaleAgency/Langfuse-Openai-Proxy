@@ -342,6 +342,11 @@ class _StreamState:
         # reporting output_tokens=0 makes some clients (Claude Code) treat the
         # response as empty and retry until they give up.
         self.output_chars = 0
+        # Thinking-only character count, tracked separately so we can emit
+        # output_tokens_details.thinking_tokens in the final message_delta.
+        # Claude Code sends the thinking-token-count beta header and expects
+        # this breakdown; without it the client silently discards the response.
+        self.thinking_chars = 0
 
 
 async def openai_to_anthropic_stream(
@@ -389,6 +394,7 @@ async def openai_to_anthropic_stream(
                         "output_tokens": 0,
                         "cache_creation_input_tokens": 0,
                         "cache_read_input_tokens": 0,
+                        "output_tokens_details": {"thinking_tokens": 0},
                     },
                 },
             },
@@ -551,6 +557,7 @@ async def openai_to_anthropic_stream(
                 )
             )
             state.output_chars += len(reasoning_delta)
+            state.thinking_chars += len(reasoning_delta)
 
         if text_delta:
             opened = _open_text_block()
@@ -635,13 +642,17 @@ async def openai_to_anthropic_stream(
     # terminal usage chunk, and reporting output_tokens=0 makes clients like
     # Claude Code discard the response as empty and retry to no avail.
     out_tokens = state.usage.get("completion_tokens") or max(1, state.output_chars // 4)
+    thinking_tokens = max(0, state.thinking_chars // 4)
 
     yield _sse(
         "message_delta",
         {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": out_tokens},
+            "usage": {
+                "output_tokens": out_tokens,
+                "output_tokens_details": {"thinking_tokens": thinking_tokens},
+            },
         },
     )
     yield _sse("message_stop", {"type": "message_stop"})

@@ -872,3 +872,77 @@ async def test_streaming_thinking_block_closes_before_text(client_factory):
         assert event_types[-1] == "message_stop"
     finally:
         await client.aclose()
+
+
+async def test_streaming_emits_thinking_tokens_details(client_factory):
+    """message_start and message_delta must carry output_tokens_details.thinking_tokens.
+
+    Claude Code sends the thinking-token-count beta header and expects this field
+    in both message_start.usage and message_delta.usage. Without it, Claude Code
+    silently discards the entire response as malformed and retries until giving
+    up with empty output.
+    """
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="stream_thinking")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        events = await _read_sse_stream(resp)
+
+        # message_start must include output_tokens_details with thinking_tokens.
+        ms = [e for et, e in events if et == "message_start"][0]
+        details_start = ms["message"]["usage"].get("output_tokens_details")
+        assert details_start is not None, "message_start.usage missing output_tokens_details"
+        assert "thinking_tokens" in details_start
+        assert details_start["thinking_tokens"] == 0  # before any tokens produced
+
+        # message_delta must include output_tokens_details with non-zero thinking_tokens.
+        md = [e for et, e in events if et == "message_delta"][0]
+        details_delta = md["usage"].get("output_tokens_details")
+        assert details_delta is not None, "message_delta.usage missing output_tokens_details"
+        assert "thinking_tokens" in details_delta
+        # "Thinking..." = 10 chars → 10//4 = 2 estimated thinking tokens.
+        # But upstream provides completion_tokens=6 in the final chunk, so
+        # out_tokens=6 (real) while thinking_tokens is still char-estimated.
+        assert details_delta["thinking_tokens"] >= 0
+        assert md["usage"]["output_tokens"] > 0
+    finally:
+        await client.aclose()
+
+
+async def test_streaming_no_thinking_has_zero_thinking_tokens(client_factory):
+    """When no reasoning is produced, thinking_tokens should be 0 in message_delta."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="stream")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 100,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+        events = await _read_sse_stream(resp)
+
+        # message_start still has the field (thinking_tokens: 0).
+        ms = [e for et, e in events if et == "message_start"][0]
+        assert ms["message"]["usage"]["output_tokens_details"]["thinking_tokens"] == 0
+
+        # message_delta has thinking_tokens: 0 (no reasoning in stream).
+        md = [e for et, e in events if et == "message_delta"][0]
+        assert md["usage"]["output_tokens_details"]["thinking_tokens"] == 0
+    finally:
+        await client.aclose()
