@@ -179,6 +179,13 @@ def anthropic_to_openai(req: dict[str, Any]) -> dict[str, Any]:
         "stream": bool(req.get("stream", False)),
     }
 
+    # Ask the upstream to emit a terminal usage chunk when streaming. Ollama's
+    # OpenAI-compat endpoint honors stream_options.include_usage and returns a
+    # final {usage: {...}} chunk, which the streaming translator carries into
+    # message_delta. Without it we fall back to a char-based estimate.
+    if out["stream"]:
+        out["stream_options"] = {"include_usage": True}
+
     # max_tokens is required by Anthropic spec; forward as-is (do NOT apply
     # MAX_TOKENS_FLOOR on this path).
     if "max_tokens" in req:
@@ -329,6 +336,12 @@ class _StreamState:
         # Final usage/stop_reason carried by the upstream's final chunk.
         self.finish_reason: str | None = None
         self.usage: dict[str, Any] = {}
+        # Accumulated output character count (thinking + text + tool args).
+        # Used to estimate output_tokens when the upstream emits no final
+        # usage chunk — Ollama's OpenAI-compat stream often omits usage, and
+        # reporting output_tokens=0 makes some clients (Claude Code) treat the
+        # response as empty and retry until they give up.
+        self.output_chars = 0
 
 
 async def openai_to_anthropic_stream(
@@ -336,11 +349,17 @@ async def openai_to_anthropic_stream(
     original_model: str,
     message_id: str,
     heartbeat_seconds: float = 15.0,
+    input_tokens: int = 0,
 ) -> AsyncIterator[str]:
     """Translate an OpenAI streaming chat completion into an Anthropic SSE stream.
 
     Consumes parsed OpenAI chunk dicts (caller parses the `data: {...}` lines).
     Yields Anthropic SSE event strings.
+
+    `input_tokens` is reported in message_start.usage. Ollama's stream doesn't
+    carry input usage, so the caller passes a chars-based estimate; without it
+    some clients (Claude Code) see input_tokens=0 on a large request and behave
+    oddly. Defaults to 0 for backward compatibility.
 
     Emits a `ping` event every `heartbeat_seconds` of upstream silence so
     Claude Code doesn't time out during long thinking gaps.
@@ -349,7 +368,7 @@ async def openai_to_anthropic_stream(
 
     # message_start is emitted lazily on the first content/finish chunk so we
     # don't emit a header for a stream that errors immediately.
-    def _ensure_started(input_tokens: int = 0) -> str:
+    def _ensure_started() -> str:
         if state.message_started:
             return ""
         state.message_started = True
@@ -531,6 +550,7 @@ async def openai_to_anthropic_stream(
                     },
                 )
             )
+            state.output_chars += len(reasoning_delta)
 
         if text_delta:
             opened = _open_text_block()
@@ -547,6 +567,7 @@ async def openai_to_anthropic_stream(
                         },
                     )
                 )
+            state.output_chars += len(text_delta)
 
         for tc_delta in tool_call_deltas:
             tdi = tc_delta.get("index", 0)
@@ -609,7 +630,11 @@ async def openai_to_anthropic_stream(
             blk["closed"] = True
 
     stop_reason = _FINISH_TO_STOP.get(state.finish_reason or "stop", "end_turn")
-    out_tokens = state.usage.get("completion_tokens", 0)
+    # Prefer real usage from the upstream's final chunk; fall back to a
+    # char-based estimate. Ollama's OpenAI-compat stream frequently omits a
+    # terminal usage chunk, and reporting output_tokens=0 makes clients like
+    # Claude Code discard the response as empty and retry to no avail.
+    out_tokens = state.usage.get("completion_tokens") or max(1, state.output_chars // 4)
 
     yield _sse(
         "message_delta",

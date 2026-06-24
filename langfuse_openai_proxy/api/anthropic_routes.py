@@ -188,6 +188,7 @@ async def create_message(
                 chunk_iter,
                 original_model=original_model,
                 message_id=message_id,
+                input_tokens=estimate_tokens_anthropic(body),
             ):
                 yield evt
 
