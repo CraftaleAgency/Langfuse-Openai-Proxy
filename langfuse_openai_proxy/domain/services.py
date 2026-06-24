@@ -206,12 +206,16 @@ class TracingService:
         credentials: Credentials,
         request: ChatRequest,
         host: str,
+        apply_max_tokens_floor: bool = True,
     ) -> dict:
         """Execute non-streaming chat completion with Langfuse tracing."""
         # Apply max_tokens floor before any routing decision — both the native
         # /api/chat path and the OpenAI-compat /v1 path read max_tokens from
-        # extra_params. See _apply_max_tokens_floor().
-        request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+        # extra_params. See _apply_max_tokens_floor(). The Anthropic shim path
+        # passes apply_max_tokens_floor=False because Anthropic clients always
+        # send an explicit max_tokens per spec.
+        if apply_max_tokens_floor:
+            request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
 
         lf = self._create_langfuse(
             credentials.public_key,
@@ -379,13 +383,16 @@ class TracingService:
         credentials: Credentials,
         request: ChatRequest,
         host: str,
+        apply_max_tokens_floor: bool = True,
     ) -> AsyncGenerator[str, None]:
         """Execute streaming chat completion with Langfuse tracing.
 
         Yields SSE-formatted chunks. Collects content for tracing after stream ends.
         """
         # Apply max_tokens floor before any routing decision — see chat_completion().
-        request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+        # The Anthropic shim path passes apply_max_tokens_floor=False.
+        if apply_max_tokens_floor:
+            request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
 
         lf = self._create_langfuse(
             credentials.public_key,
