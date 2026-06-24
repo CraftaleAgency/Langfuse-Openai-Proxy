@@ -11,6 +11,8 @@ single-client route — not multi-tenant like /v1/chat/completions.
 """
 
 import json
+import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -30,6 +32,9 @@ from ..infrastructure.config import Settings
 from ..infrastructure.langfuse_client import create_langfuse_client
 from ..infrastructure.openai_client import create_openai_client
 from .dependencies import get_settings
+
+logger = logging.getLogger("anthropic_shim")
+_SHIM_DEBUG = os.environ.get("ANTHROPIC_SHIM_DEBUG", "").lower() in ("1", "true", "yes")
 
 router = APIRouter(prefix="/v1", tags=["anthropic"])
 
@@ -179,18 +184,53 @@ async def create_message(
     if chat_request.stream:
         message_id = f"msg_{int(time.time() * 1000)}"
 
+        if _SHIM_DEBUG:
+            logger.info(
+                "[shim] REQ model=%s phys=%s stream=true thinking=%s tools=%d "
+                "msgs=%d max_tokens=%s",
+                requested_model,
+                physical_model,
+                "thinking" in body,
+                len(body.get("tools") or []),
+                len(body.get("messages") or []),
+                body.get("max_tokens"),
+            )
+
         async def anthropic_event_stream() -> AsyncIterator[str]:
             openai_sse = service.stream_chat_completion(
                 credentials, chat_request, host, apply_max_tokens_floor=False
             )
             chunk_iter = _gen_openai_chunks(openai_sse)
+            blocks: list[str] = []
+            stop_reason = None
+            usage_seen = None
             async for evt in openai_to_anthropic_stream(
                 chunk_iter,
                 original_model=original_model,
                 message_id=message_id,
                 input_tokens=estimate_tokens_anthropic(body),
             ):
+                if _SHIM_DEBUG:
+                    try:
+                        _, data_part = evt.split("data: ", 1)
+                        parsed = json.loads(data_part.strip())
+                    except (ValueError, json.JSONDecodeError):
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        if parsed.get("type") == "content_block_start":
+                            blocks.append((parsed.get("content_block") or {}).get("type"))
+                        elif parsed.get("type") == "message_delta":
+                            stop_reason = (parsed.get("delta") or {}).get("stop_reason")
+                            usage_seen = parsed.get("usage")
                 yield evt
+            if _SHIM_DEBUG:
+                logger.info(
+                    "[shim] RESP %s blocks=%s stop=%s usage=%s",
+                    message_id,
+                    blocks,
+                    stop_reason,
+                    usage_seen,
+                )
 
         return StreamingResponse(
             anthropic_event_stream(),

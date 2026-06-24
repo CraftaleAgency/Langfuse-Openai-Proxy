@@ -25,6 +25,7 @@ services:
       - ANTHROPIC_MODEL_MAP=${ANTHROPIC_MODEL_MAP:-claude-3-5-sonnet-20241022:coder14b:latest,claude-sonnet-4-5:coder14b:latest,claude-3-5-haiku-20241022:gemma4:12b,claude-haiku-4-5:gemma4:12b,claude-3-opus-20240229:coder14b:latest,claude-opus-4-5:coder14b:latest}
       - ANTHROPIC_DEFAULT_MODEL=${ANTHROPIC_DEFAULT_MODEL:-coder14b:latest}
       - ANTHROPIC_PAUSED=${ANTHROPIC_PAUSED:-false}
+      - ANTHROPIC_SHIM_DEBUG=${ANTHROPIC_SHIM_DEBUG:-false}
     networks:
       - default
       - dokploy-network
