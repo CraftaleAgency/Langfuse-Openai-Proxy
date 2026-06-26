@@ -510,15 +510,26 @@ async def openai_to_anthropic_stream(
     exhausted = False
 
     while not exhausted:
-        try:
-            chunk: dict[str, Any] = await asyncio.wait_for(
-                iterator.__anext__(), timeout=heartbeat_seconds
+        # Wait for the next upstream chunk WITHOUT cancelling it on timeout.
+        # The previous implementation used asyncio.wait_for, which cancels its
+        # inner awaitable when the timeout fires — and cancelling an in-flight
+        # httpx stream read severs the upstream connection. During Ollama's long
+        # prompt-eval silence (40s+ on large tool-heavy prompts, while
+        # heartbeat_seconds is ~15s) that cancellation killed the stream and we
+        # fell through to the empty-stream fallback, yielding a blank response.
+        # asyncio.wait does NOT cancel pending tasks, so we can emit ping
+        # keepalives while the slow upstream chunk stays in flight.
+        next_task = asyncio.ensure_future(iterator.__anext__())
+        while True:
+            done, _pending = await asyncio.wait(
+                {next_task}, timeout=heartbeat_seconds
             )
-        except TimeoutError:
-            # Upstream silent for too long — keep the client alive.
+            if done:
+                break
             if state.message_started:
                 yield _sse("ping", {"type": "ping"})
-            continue
+        try:
+            chunk = next_task.result()
         except StopAsyncIteration:
             exhausted = True
             break
