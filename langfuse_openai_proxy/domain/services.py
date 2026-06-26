@@ -172,6 +172,30 @@ def _extract_output_text(response_data: dict) -> str:
     return " ".join(texts)
 
 
+# Background Langfuse flush tasks. We retain strong references so asyncio does
+# not garbage-collect a task mid-flight (see asyncio.create_task docs: "Save a
+# reference to the result ... to avoid a task disappearing mid-execution"). Each
+# task removes itself from the set on completion via the done-callback.
+_background_flushes: set[asyncio.Task] = set()
+
+
+def _schedule_flush(lf) -> None:
+    """Flush Langfuse in the background, off the response's critical path.
+
+    Tracing is observability, not part of the request's critical path: each
+    previous `await asyncio.to_thread(lf.flush)` serialized one network
+    round-trip to Langfuse into every response. We instead fire the flush as a
+    detached task so the caller gets their answer immediately. Safe because, by
+    the time the finally-block runs, generation.end() has already been called
+    and no further mutation of this request's `lf` occurs. Best-effort by
+    design — a hard process exit may drop an in-flight flush, an acceptable
+    trade for not blocking every response on observability I/O.
+    """
+    task = asyncio.create_task(asyncio.to_thread(lf.flush))
+    _background_flushes.add(task)
+    task.add_done_callback(_background_flushes.discard)
+
+
 class TracingService:
     """Orchestrates LLM calls with Langfuse tracing.
 
@@ -253,7 +277,7 @@ class TracingService:
                 generation.end()
                 raise
             finally:
-                await asyncio.to_thread(lf.flush)
+                _schedule_flush(lf)
             return data
 
         try:
@@ -279,7 +303,7 @@ class TracingService:
             generation.end()
             raise
         finally:
-            await asyncio.to_thread(lf.flush)
+            _schedule_flush(lf)
 
         data = response.model_dump()
 
@@ -440,7 +464,7 @@ class TracingService:
                 # never reached. OTel does not export unended spans, so without
                 # this the streaming trace is silently lost.
                 generation.end()
-                await asyncio.to_thread(lf.flush)
+                _schedule_flush(lf)
             return
 
         collected_content = []
@@ -489,7 +513,7 @@ class TracingService:
             # See native-stream path: end() in finally so early-closing
             # consumers don't leave the span unended (and thus unexported).
             generation.end()
-            await asyncio.to_thread(lf.flush)
+            _schedule_flush(lf)
 
     async def embedding(
         self,
@@ -528,7 +552,7 @@ class TracingService:
             generation.end()
             raise
         finally:
-            await asyncio.to_thread(lf.flush)
+            _schedule_flush(lf)
 
         return response.model_dump()
 
@@ -581,7 +605,7 @@ class TracingService:
             generation.end()
             raise
         finally:
-            await asyncio.to_thread(lf.flush)
+            _schedule_flush(lf)
 
         return response_data, resp.status_code
 
@@ -656,4 +680,4 @@ class TracingService:
             generation.end()
             raise
         finally:
-            await asyncio.to_thread(lf.flush)
+            _schedule_flush(lf)
