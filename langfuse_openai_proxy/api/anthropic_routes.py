@@ -33,7 +33,7 @@ from ..infrastructure.langfuse_client import create_langfuse_client
 from ..infrastructure.openai_client import create_openai_client
 from .dependencies import get_settings
 
-logger = logging.getLogger("anthropic_shim")
+logger = logging.getLogger("uvicorn.error")
 _SHIM_DEBUG = os.environ.get("ANTHROPIC_SHIM_DEBUG", "").lower() in ("1", "true", "yes")
 
 router = APIRouter(prefix="/v1", tags=["anthropic"])
