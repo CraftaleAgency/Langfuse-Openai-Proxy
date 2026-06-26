@@ -28,8 +28,14 @@ def _make_chunk(content: str | None, reasoning: str | None, finish_reason: str |
         "tool_calls": None,
     }
 
+    # NB: assign in __init__, not the class body. Class bodies don't see the
+    # enclosing function's locals, so `content = content` at class scope raises
+    # NameError. __init__ is a real closure, so the param is visible. The
+    # .content attribute is read by TracingService (chunk.choices[0].delta.content)
+    # to collect output for tracing.
     class _Delta:
-        content = content
+        def __init__(self):
+            self.content = content
 
     class _Choice:
         delta = _Delta()
