@@ -430,12 +430,16 @@ class TracingService:
                         except json.JSONDecodeError:
                             pass
                 generation.update(output="".join(collected_content))
-                generation.end()
             except Exception as e:
                 generation.update(level="ERROR", status_message=str(e))
-                generation.end()
                 raise
             finally:
+                # end() must run in finally: when the consumer stops early
+                # (e.g. the Anthropic translator breaks on finish_reason and
+                # closes this generator via aclose), the try-body's end() is
+                # never reached. OTel does not export unended spans, so without
+                # this the streaming trace is silently lost.
+                generation.end()
                 await asyncio.to_thread(lf.flush)
             return
 
@@ -477,13 +481,14 @@ class TracingService:
             yield "data: [DONE]\n\n"
 
             generation.update(output="".join(collected_content))
-            generation.end()
 
         except Exception as e:
             generation.update(level="ERROR", status_message=str(e))
-            generation.end()
             raise
         finally:
+            # See native-stream path: end() in finally so early-closing
+            # consumers don't leave the span unended (and thus unexported).
+            generation.end()
             await asyncio.to_thread(lf.flush)
 
     async def embedding(
