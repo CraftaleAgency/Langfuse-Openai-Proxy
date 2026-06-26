@@ -6,10 +6,11 @@ Delegates business logic to TracingService.
 
 import json
 
+import httpx
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import Response, StreamingResponse
 
-from ..domain.errors import MissingCredentialsError
+from ..domain.errors import MissingCredentialsError, UpstreamError
 from ..domain.models import (
     ChatRequest,
     Credentials,
@@ -270,11 +271,14 @@ async def proxy_passthrough(
         headers["Authorization"] = f"Bearer {settings.upstream_api_key}"
 
     body = await request.body()
-    resp = await http.request(
-        method=request.method,
-        url=upstream_url,
-        headers=headers,
-        content=body or None,
-        timeout=120,
-    )
+    try:
+        resp = await http.request(
+            method=request.method,
+            url=upstream_url,
+            headers=headers,
+            content=body or None,
+            timeout=120,
+        )
+    except httpx.TransportError as e:
+        raise UpstreamError("Upstream unreachable") from e
     return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))

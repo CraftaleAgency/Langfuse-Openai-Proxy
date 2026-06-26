@@ -11,9 +11,11 @@ import json
 import time
 from collections.abc import AsyncGenerator
 
+import httpx
 from openai import AsyncOpenAI
 
 from ..infrastructure.openai_client import get_http_client
+from .errors import UpstreamError
 from .models import ChatRequest, Credentials, EmbeddingRequest, ResponsesRequest
 
 
@@ -338,8 +340,16 @@ class TracingService:
         )
         body["stream"] = False
 
-        resp = await http.post(url, headers=headers, json=body, timeout=600)
-        resp.raise_for_status()
+        try:
+            resp = await http.post(url, headers=headers, json=body, timeout=600)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Preserve the upstream status (4xx/5xx) rather than flattening to 502.
+            raise UpstreamError(str(e), status_code=e.response.status_code) from e
+        except httpx.TransportError as e:
+            # Connection / timeout — no upstream response to forward.
+            raise UpstreamError("Ollama native endpoint unreachable") from e
+
         payload = resp.json()
         return _ollama_native_to_openai(request.model, payload)
 
@@ -360,45 +370,63 @@ class TracingService:
         created = int(time.time())
         completion_id = f"chatcmpl-ollama-{int(time.time() * 1000)}"
 
-        async with http.stream("POST", url, headers=headers, json=body, timeout=600) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                msg = chunk.get("message", {}) or {}
-                content = msg.get("content", "") or ""
-                reasoning = msg.get("reasoning", "") or ""
-                if not content and reasoning and self._reasoning_as_content:
-                    content = reasoning
-                if not content and not reasoning:
-                    # Keep-alive or mid-stream empty delta; skip unless final.
+        try:
+            async with http.stream("POST", url, headers=headers, json=body, timeout=600) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = chunk.get("message", {}) or {}
+                    content = msg.get("content", "") or ""
+                    reasoning = msg.get("reasoning", "") or ""
+                    if not content and reasoning and self._reasoning_as_content:
+                        content = reasoning
+                    if not content and not reasoning:
+                        # Keep-alive or mid-stream empty delta; skip unless final.
+                        if chunk.get("done"):
+                            break
+                        continue
+                    finish = None
+                    if chunk.get("done"):
+                        finish = "length" if chunk.get("done_reason") == "length" else "stop"
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": content} if content else {},
+                                "finish_reason": finish,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
                     if chunk.get("done"):
                         break
-                    continue
-                finish = None
-                if chunk.get("done"):
-                    finish = "length" if chunk.get("done_reason") == "length" else "stop"
-                data = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": request.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": content} if content else {},
-                            "finish_reason": finish,
+        except httpx.TransportError:
+            # Connection failed before/while streaming. Emit an SSE error frame
+            # (StreamingResponse has already committed 200 headers by the time a
+            # generator raises, so we can't switch to a 502 — an error event is
+            # the correct SSE-client semantics) and end the stream cleanly.
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "error": {
+                            "message": "Ollama native endpoint unreachable",
+                            "type": "upstream_connection_error",
                         }
-                    ],
-                }
-                yield f"data: {json.dumps(data)}\n\n"
-                if chunk.get("done"):
-                    break
+                    }
+                )
+                + "\n\n"
+            )
 
         yield "data: [DONE]\n\n"
 
@@ -603,6 +631,8 @@ class TracingService:
         except Exception as e:
             generation.update(level="ERROR", status_message=str(e))
             generation.end()
+            if isinstance(e, httpx.TransportError):
+                raise UpstreamError("Upstream responses endpoint unreachable") from e
             raise
         finally:
             _schedule_flush(lf)
@@ -675,6 +705,26 @@ class TracingService:
                 },
             )
             generation.end()
+        except httpx.TransportError as e:
+            # Connection failed before the stream produced anything. Emit an SSE
+            # error event and end the stream at HTTP 200 — StreamingResponse has
+            # already committed its headers by the time a generator raises, so a
+            # 502 is impossible mid-stream; an error frame is the correct SSE
+            # semantics. ConnectError fires at `async with` entry, before any
+            # data chunk, so the client never sees partial content.
+            generation.update(level="ERROR", status_message=str(e))
+            generation.end()
+            err = json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "Upstream responses endpoint unreachable",
+                        "type": "upstream_connection_error",
+                    },
+                }
+            )
+            yield f"event: error\ndata: {err}\n\n"
+            return
         except Exception as e:
             generation.update(level="ERROR", status_message=str(e))
             generation.end()
