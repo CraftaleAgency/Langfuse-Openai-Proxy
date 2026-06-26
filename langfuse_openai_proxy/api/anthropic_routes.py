@@ -188,6 +188,17 @@ async def create_message(
         },
     )
 
+    # Thinking control. Default (ANTHROPIC_SHIM_THINK=false): pin think=false
+    # so TracingService routes through Ollama's native /api/chat, which honors
+    # the flag and produces concise, fast answers. The alternative (/v1) leaves
+    # thinking models to ramble unboundedly — they fill the whole max_tokens
+    # budget with reasoning, yielding empty content, >32K-token responses, and
+    # >120s generation that trips Cloudflare's 524. When thinking IS enabled we
+    # leave `think` unset so the request stays on /v1, whose delta.reasoning the
+    # translator turns into Anthropic thinking blocks.
+    if not settings.anthropic_shim_think:
+        chat_request.extra_params["think"] = False
+
     service = _build_tracing_service(settings)
     host = settings.langfuse_default_host
 

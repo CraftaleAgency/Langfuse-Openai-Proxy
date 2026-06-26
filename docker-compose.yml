@@ -26,6 +26,7 @@ services:
       - ANTHROPIC_DEFAULT_MODEL=${ANTHROPIC_DEFAULT_MODEL:-coder14b:latest}
       - ANTHROPIC_PAUSED=${ANTHROPIC_PAUSED:-false}
       - ANTHROPIC_SHIM_DEBUG=${ANTHROPIC_SHIM_DEBUG:-false}
+      - ANTHROPIC_SHIM_THINK=${ANTHROPIC_SHIM_THINK:-false}
     networks:
       - default
       - dokploy-network

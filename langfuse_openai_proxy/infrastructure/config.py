@@ -99,6 +99,19 @@ class Settings:
         "yes",
         "on",
     )
+    # Emit thinking blocks (route via Ollama /v1, which exposes delta.reasoning)?
+    # Default False: route via Ollama native /api/chat with think=false so the
+    # model answers concisely. Thinking models left on /v1 ramble unboundedly
+    # (Ollama /v1 ignores thinking budgets), filling the whole max_tokens budget
+    # with reasoning — empty content, >32K-token responses, and >120s generation
+    # that trips Cloudflare's 524. Set true to restore thinking blocks (with the
+    # rambling/timeout risk that entails).
+    anthropic_shim_think: bool = os.environ.get("ANTHROPIC_SHIM_THINK", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     def __post_init__(self) -> None:
         # frozen=True blocks normal assignment, so use object.__setattr__.
