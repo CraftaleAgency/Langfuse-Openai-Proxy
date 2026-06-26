@@ -10,7 +10,13 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import Response, StreamingResponse
 
 from ..domain.errors import MissingCredentialsError
-from ..domain.models import ChatRequest, Credentials, EmbeddingRequest, ResponsesRequest
+from ..domain.models import (
+    ChatRequest,
+    Credentials,
+    EmbeddingRequest,
+    ResponsesRequest,
+    parse_combined_credentials,
+)
 from ..domain.services import TracingService
 from ..infrastructure.config import Settings
 from ..infrastructure.host_validation import validate_langfuse_host
@@ -21,21 +27,12 @@ router = APIRouter()
 
 
 def _extract_by_prefix(raw: str) -> Credentials | None:
-    """Extract keys by finding pk-lf- and sk-lf- prefixes in a concatenated string."""
-    pk_start = raw.find("pk-lf-")
-    sk_start = raw.find("sk-lf-")
-    if pk_start == -1 or sk_start == -1:
-        return None
+    """Extract keys by finding pk-lf- and sk-lf- prefixes in a concatenated string.
 
-    # Determine which comes first and extract accordingly
-    if pk_start < sk_start:
-        public_key = raw[pk_start:sk_start].strip()
-        secret_key = raw[sk_start:].strip()
-    else:
-        secret_key = raw[sk_start:pk_start].strip()
-        public_key = raw[pk_start:].strip()
-
-    return Credentials(public_key=public_key, secret_key=secret_key)
+    Thin wrapper over the shared domain helper so the OpenAI chat path and the
+    Anthropic shim parse combined credentials identically.
+    """
+    return parse_combined_credentials(raw)
 
 
 def parse_credentials(

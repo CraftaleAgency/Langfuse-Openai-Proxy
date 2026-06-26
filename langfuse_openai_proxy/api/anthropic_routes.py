@@ -26,7 +26,7 @@ from ..domain.anthropic_translator import (
     openai_to_anthropic_response,
     openai_to_anthropic_stream,
 )
-from ..domain.models import ChatRequest, Credentials
+from ..domain.models import ChatRequest, Credentials, parse_combined_credentials
 from ..domain.services import TracingService
 from ..infrastructure.config import Settings
 from ..infrastructure.langfuse_client import create_langfuse_client
@@ -50,20 +50,34 @@ def _extract_anthropic_token(authorization: str | None, x_api_key: str | None) -
 
 
 def _resolve_anthropic_credentials(token: str | None, settings: Settings) -> Credentials:
-    """Validate the single token against env LANGFUSE_SECRET_KEY.
+    """Validate the caller's token and return Langfuse Credentials for tracing.
 
-    Returns Credentials built from the env's Langfuse keys — the Anthropic
-    path traces to the proxy's own Langfuse project, not a per-request one.
+    Accepts the same credential formats as the OpenAI chat path so Claude Code
+    can use the combined pk|sk pair as its single credential:
+      - bare secret key: `sk-lf-...`
+      - combined pair (any order, any separator): `sk-lf-...,pk-lf-...`,
+        `pk-lf-...|sk-lf-...`, concatenated, etc. (shared parser).
+
+    The secret key must match env LANGFUSE_SECRET_KEY (fail closed). The public
+    key is taken from the token when present, else the env default. Tracing
+    uses the resolved pk/sk so the caller's traffic lands in its Langfuse
+    project — giving per-client traceability from Claude Code.
     """
     if not settings.langfuse_secret_key:
         # Misconfigured deployment — fail closed rather than allowing unauthenticated access.
         raise HTTPException(503, "Anthropic shim not configured: LANGFUSE_SECRET_KEY missing")
-    if not token or token != settings.langfuse_secret_key:
+    if not token:
         raise HTTPException(401, "invalid api key")
-    return Credentials(
-        public_key=settings.langfuse_public_key,
-        secret_key=settings.langfuse_secret_key,
-    )
+    raw = token.removeprefix("Bearer ").strip()
+    creds = parse_combined_credentials(raw)
+    if creds is None:
+        # Bare token with no recognized pk+sk pair → treat as the secret key.
+        creds = Credentials(public_key=settings.langfuse_public_key, secret_key=raw)
+    if creds.secret_key != settings.langfuse_secret_key:
+        raise HTTPException(401, "invalid api key")
+    if not creds.public_key:
+        creds = Credentials(public_key=settings.langfuse_public_key, secret_key=creds.secret_key)
+    return creds
 
 
 def _build_tracing_service(settings: Settings) -> TracingService:
@@ -201,36 +215,47 @@ async def create_message(
                 credentials, chat_request, host, apply_max_tokens_floor=False
             )
             chunk_iter = _gen_openai_chunks(openai_sse)
-            blocks: list[str] = []
-            stop_reason = None
-            usage_seen = None
-            async for evt in openai_to_anthropic_stream(
+            translator = openai_to_anthropic_stream(
                 chunk_iter,
                 original_model=original_model,
                 message_id=message_id,
                 input_tokens=estimate_tokens_anthropic(body),
-            ):
+            )
+            blocks: list[str] = []
+            stop_reason = None
+            usage_seen = None
+            try:
+                async for evt in translator:
+                    if _SHIM_DEBUG:
+                        try:
+                            _, data_part = evt.split("data: ", 1)
+                            parsed = json.loads(data_part.strip())
+                        except (ValueError, json.JSONDecodeError):
+                            parsed = None
+                        if isinstance(parsed, dict):
+                            if parsed.get("type") == "content_block_start":
+                                blocks.append((parsed.get("content_block") or {}).get("type"))
+                            elif parsed.get("type") == "message_delta":
+                                stop_reason = (parsed.get("delta") or {}).get("stop_reason")
+                                usage_seen = parsed.get("usage")
+                    yield evt
+            finally:
+                # Explicitly close the upstream generators. The translator breaks
+                # out as soon as it sees finish_reason, leaving stream_chat_completion
+                # pending — and its `finally` block (which flushes the Langfuse
+                # trace) only runs when the generator is closed. Without this,
+                # completed streams never flush and traces silently go missing.
+                await translator.aclose()
+                await chunk_iter.aclose()
+                await openai_sse.aclose()
                 if _SHIM_DEBUG:
-                    try:
-                        _, data_part = evt.split("data: ", 1)
-                        parsed = json.loads(data_part.strip())
-                    except (ValueError, json.JSONDecodeError):
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        if parsed.get("type") == "content_block_start":
-                            blocks.append((parsed.get("content_block") or {}).get("type"))
-                        elif parsed.get("type") == "message_delta":
-                            stop_reason = (parsed.get("delta") or {}).get("stop_reason")
-                            usage_seen = parsed.get("usage")
-                yield evt
-            if _SHIM_DEBUG:
-                logger.info(
-                    "[shim] RESP %s blocks=%s stop=%s usage=%s",
-                    message_id,
-                    blocks,
-                    stop_reason,
-                    usage_seen,
-                )
+                    logger.info(
+                        "[shim] RESP %s blocks=%s stop=%s usage=%s",
+                        message_id,
+                        blocks,
+                        stop_reason,
+                        usage_seen,
+                    )
 
         return StreamingResponse(
             anthropic_event_stream(),
