@@ -213,6 +213,7 @@ class TracingService:
         upstream_api_key: str,
         reasoning_as_content: bool = False,
         max_tokens_floor: int | None = None,
+        chat_think_off: bool = False,
     ):
         self._create_langfuse = langfuse_client_factory
         self._openai = openai_client
@@ -226,6 +227,9 @@ class TracingService:
         # don't burn their entire (small) budget on hidden thinking. See
         # Settings.max_tokens_floor.
         self._max_tokens_floor = max_tokens_floor
+        # When True, chat requests with no explicit `think` default to think=False
+        # (routed via native /api/chat) for concise output. See Settings.chat_think_off.
+        self._chat_think_off = chat_think_off
 
     async def chat_completion(
         self,
@@ -242,6 +246,13 @@ class TracingService:
         # send an explicit max_tokens per spec.
         if apply_max_tokens_floor:
             request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+
+        # When chat_think_off is enabled and the caller didn't set `think`,
+        # default to think=False so the request routes through native /api/chat
+        # (the only endpoint honoring think) for concise, non-reasoning output.
+        if self._chat_think_off and "think" not in (request.extra_params or {}):
+            request.extra_params = dict(request.extra_params or {})
+            request.extra_params["think"] = False
 
         lf = self._create_langfuse(
             credentials.public_key,
@@ -445,6 +456,13 @@ class TracingService:
         # The Anthropic shim path passes apply_max_tokens_floor=False.
         if apply_max_tokens_floor:
             request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+
+        # When chat_think_off is enabled and the caller didn't set `think`,
+        # default to think=False so the request routes through native /api/chat
+        # (the only endpoint honoring think) for concise, non-reasoning output.
+        if self._chat_think_off and "think" not in (request.extra_params or {}):
+            request.extra_params = dict(request.extra_params or {})
+            request.extra_params["think"] = False
 
         lf = self._create_langfuse(
             credentials.public_key,

@@ -61,6 +61,7 @@ Credentials are passed per-request (not global config) via two formats:
 - `UPSTREAM_BASE_URL` — OpenAI-compatible backend (default: `http://localhost:4000/v1`)
 - `UPSTREAM_API_KEY` — API key for upstream (optional)
 - `LANGFUSE_DEFAULT_HOST` — Default Langfuse host (default: `https://cloud.langfuse.com`)
+- `CHAT_THINK_OFF` — When true, generic `/v1/chat/completions` requests with no explicit `think` route through native `/api/chat` with `think=false` for concise output (default off; the Anthropic shim does this regardless)
 
 ## Code Style
 

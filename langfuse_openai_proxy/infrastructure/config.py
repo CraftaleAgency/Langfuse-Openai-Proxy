@@ -68,6 +68,19 @@ class Settings:
     max_tokens_floor: int | None = (
         int(v) if (v := os.environ.get("MAX_TOKENS_FLOOR", "").strip()).isdigit() else None
     )
+    # When True, generic /v1/chat/completions requests that don't already specify
+    # `think` are routed through Ollama's native /api/chat with think=false — the
+    # only endpoint that honors it (the OpenAI-compat /v1 silently ignores
+    # `think`, letting reasoning models ramble and burn the whole token budget on
+    # hidden reasoning). Gives non-shim clients the same concise, fast answers the
+    # Anthropic shim gets by default. Default off: existing /v1 clients keep their
+    # current (reasoning-as-content) behavior unless explicitly opted in.
+    chat_think_off: bool = os.environ.get("CHAT_THINK_OFF", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     # Anthropic /v1/messages shim. When True, the proxy mounts the
     # /v1/messages, /v1/messages/count_tokens, /v1/messages/{id}, and
     # /v1/models endpoints that emit Anthropic-shape responses. This is
