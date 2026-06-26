@@ -521,9 +521,7 @@ async def openai_to_anthropic_stream(
         # keepalives while the slow upstream chunk stays in flight.
         next_task = asyncio.ensure_future(iterator.__anext__())
         while True:
-            done, _pending = await asyncio.wait(
-                {next_task}, timeout=heartbeat_seconds
-            )
+            done, _pending = await asyncio.wait({next_task}, timeout=heartbeat_seconds)
             if done:
                 break
             if state.message_started:

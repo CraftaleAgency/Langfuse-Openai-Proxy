@@ -245,7 +245,9 @@ class TracingService:
         # passes apply_max_tokens_floor=False because Anthropic clients always
         # send an explicit max_tokens per spec.
         if apply_max_tokens_floor:
-            request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+            request.extra_params = _apply_max_tokens_floor(
+                request.extra_params, self._max_tokens_floor
+            )
 
         # When chat_think_off is enabled and the caller didn't set `think`,
         # default to think=False so the request routes through native /api/chat
@@ -455,7 +457,9 @@ class TracingService:
         # Apply max_tokens floor before any routing decision — see chat_completion().
         # The Anthropic shim path passes apply_max_tokens_floor=False.
         if apply_max_tokens_floor:
-            request.extra_params = _apply_max_tokens_floor(request.extra_params, self._max_tokens_floor)
+            request.extra_params = _apply_max_tokens_floor(
+                request.extra_params, self._max_tokens_floor
+            )
 
         # When chat_think_off is enabled and the caller didn't set `think`,
         # default to think=False so the request routes through native /api/chat

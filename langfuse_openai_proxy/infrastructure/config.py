@@ -130,5 +130,7 @@ class Settings:
         # frozen=True blocks normal assignment, so use object.__setattr__.
         if not self.anthropic_model_map:
             object.__setattr__(
-                self, "anthropic_model_map", _parse_anthropic_model_map(self.anthropic_model_map_raw)
+                self,
+                "anthropic_model_map",
+                _parse_anthropic_model_map(self.anthropic_model_map_raw),
             )

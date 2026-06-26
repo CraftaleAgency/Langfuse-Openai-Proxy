@@ -87,9 +87,7 @@ def _service(*, chat_think_off):
 async def test_chat_think_off_routes_native_with_think_false(monkeypatch):
     """No-think request + chat_think_off → native /api/chat with think=false."""
     fake_http = _FakeHttpClient()
-    monkeypatch.setattr(
-        "langfuse_openai_proxy.domain.services.get_http_client", lambda: fake_http
-    )
+    monkeypatch.setattr("langfuse_openai_proxy.domain.services.get_http_client", lambda: fake_http)
     svc = _service(chat_think_off=True)
 
     request = ChatRequest(
@@ -117,9 +115,7 @@ async def test_chat_think_off_routes_native_with_think_false(monkeypatch):
 async def test_chat_think_off_respects_explicit_think(monkeypatch):
     """An explicit think=true is not clobbered to false by chat_think_off."""
     fake_http = _FakeHttpClient()
-    monkeypatch.setattr(
-        "langfuse_openai_proxy.domain.services.get_http_client", lambda: fake_http
-    )
+    monkeypatch.setattr("langfuse_openai_proxy.domain.services.get_http_client", lambda: fake_http)
     svc = _service(chat_think_off=True)
 
     request = ChatRequest(
