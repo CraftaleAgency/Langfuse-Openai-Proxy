@@ -78,6 +78,14 @@ _OLLAMA_SCHEMA_DROP_KEYS = frozenset(
         "dependencies",
         "dependentRequired",
         "dependentSchemas",
+        "prefixItems",
+        "propertyNames",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "if",
+        "then",
+        "else",
+        "not",
     }
 )
 
@@ -130,6 +138,10 @@ def _sanitize_json_schema(schema: Any) -> Any:
             out[key] = {name: _sanitize_json_schema(sub) for name, sub in value.items()}
             continue
         if key == "items":
+            # JSON-Schema allows `items` as a list (tuple validation); llama.cpp
+            # expects a single schema, so collapse a list to its first element.
+            if isinstance(value, list):
+                value = value[0] if value else {}
             out[key] = _sanitize_json_schema(value)
             continue
         out[key] = value
@@ -553,6 +565,14 @@ class TracingService:
                         len(body.get("tools") or []),
                         len(request.messages),
                     )
+                    # Debug aid: persist the (sanitized) tools payload Ollama
+                    # rejected so the offending schema can be located offline.
+                    # Best-effort — never let a dump failure mask the real error.
+                    with (
+                        contextlib.suppress(Exception),
+                        open(f"/tmp/ollama_bad_tools_{int(time.time())}.json", "w") as f,
+                    ):
+                        json.dump(body.get("tools") or [], f)
                     yield (
                         "data: "
                         + json.dumps(

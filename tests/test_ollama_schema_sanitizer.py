@@ -125,3 +125,25 @@ def test_build_ollama_native_body_sanitizes_tools():
     )
     assert body["tools"][0]["function"]["parameters"]["additionalProperties"] is False
     assert body["think"] is False
+
+
+def test_tuple_items_collapsed_to_first():
+    # JSON-Schema tuple validation (items as a list) isn't supported by llama.cpp.
+    schema = {"type": "array", "items": [{"type": "string"}, {"type": "number"}]}
+    out = _sanitize_json_schema(schema)
+    assert out["items"] == {"type": "string"}
+
+
+def test_conditional_and_prefix_keywords_dropped():
+    schema = {
+        "type": "object",
+        "prefixItems": [{"type": "string"}],
+        "propertyNames": {"pattern": "^[a-z]+$"},
+        "if": {"type": "object"},
+        "then": {"type": "object"},
+        "else": {"type": "string"},
+        "not": {"type": "null"},
+    }
+    out = _sanitize_json_schema(schema)
+    for dropped in ("prefixItems", "propertyNames", "if", "then", "else", "not"):
+        assert dropped not in out
