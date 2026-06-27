@@ -22,8 +22,8 @@ services:
       - REASONING_AS_CONTENT=${REASONING_AS_CONTENT:-false}
       - MAX_TOKENS_FLOOR=${MAX_TOKENS_FLOOR:-}
       - ANTHROPIC_SHIM_ENABLED=${ANTHROPIC_SHIM_ENABLED:-true}
-      - ANTHROPIC_MODEL_MAP=${ANTHROPIC_MODEL_MAP:-claude-3-5-sonnet-20241022:coder14b:latest,claude-sonnet-4-5:coder14b:latest,claude-3-5-haiku-20241022:gemma4:12b,claude-haiku-4-5:gemma4:12b,claude-3-opus-20240229:coder14b:latest,claude-opus-4-5:coder14b:latest}
-      - ANTHROPIC_DEFAULT_MODEL=${ANTHROPIC_DEFAULT_MODEL:-coder14b:latest}
+      - ANTHROPIC_MODEL_MAP=${ANTHROPIC_MODEL_MAP:-claude-3-haiku-*:qwen-haiku:4b,claude-3-5-haiku-*:qwen-haiku:4b,claude-haiku-*:qwen-haiku:4b,claude-3-sonnet-*:qwythos:9b,claude-3-5-sonnet-*:qwythos:9b,claude-3-7-sonnet-*:qwythos:9b,claude-sonnet-*:qwythos:9b,claude-3-opus-*:deepseek-coder-v2:16b-lite-instruct-q4_K_M,claude-opus-*:deepseek-coder-v2:16b-lite-instruct-q4_K_M}
+      - ANTHROPIC_DEFAULT_MODEL=${ANTHROPIC_DEFAULT_MODEL:-qwythos:9b}
       - ANTHROPIC_PAUSED=${ANTHROPIC_PAUSED:-false}
       - ANTHROPIC_SHIM_DEBUG=${ANTHROPIC_SHIM_DEBUG:-false}
       - ANTHROPIC_SHIM_THINK=${ANTHROPIC_SHIM_THINK:-false}

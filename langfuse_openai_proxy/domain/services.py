@@ -7,7 +7,9 @@ The returned LangfuseGeneration object uses:
 """
 
 import asyncio
+import contextlib
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 
@@ -17,6 +19,8 @@ from openai import AsyncOpenAI
 from ..infrastructure.openai_client import get_http_client
 from .errors import UpstreamError
 from .models import ChatRequest, Credentials, EmbeddingRequest, ResponsesRequest
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_input_text(input_data: str | list[dict]) -> str:
@@ -392,7 +396,23 @@ class TracingService:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             # Preserve the upstream status (4xx/5xx) rather than flattening to 502.
-            raise UpstreamError(str(e), status_code=e.response.status_code) from e
+            # Read Ollama's error body — str(e) alone is just "400 Bad Request"
+            # and hides the real cause (e.g. a tool schema Ollama rejects).
+            err_text = ""
+            with contextlib.suppress(Exception):
+                err_text = e.response.text.strip()[:1000]
+            logger.error(
+                "[ollama] /api/chat %s: %s | model=%s tools=%d msgs=%d",
+                e.response.status_code,
+                err_text,
+                request.model,
+                len(body.get("tools") or []),
+                len(request.messages),
+            )
+            raise UpstreamError(
+                f"ollama /api/chat {e.response.status_code}: {err_text}",
+                status_code=e.response.status_code,
+            ) from e
         except httpx.TransportError as e:
             # Connection / timeout — no upstream response to forward.
             raise UpstreamError("Ollama native endpoint unreachable") from e
@@ -419,7 +439,38 @@ class TracingService:
 
         try:
             async with http.stream("POST", url, headers=headers, json=body, timeout=600) as resp:
-                resp.raise_for_status()
+                if resp.status_code >= 400:
+                    # Read Ollama's error body BEFORE the stream context closes and
+                    # discards it. raise_for_status() would yield only a generic
+                    # "400 Bad Request" (hiding the real cause, e.g. a rejected tool
+                    # schema) AND raise an unhandled HTTPStatusError that crashes the
+                    # ASGI app once the 200/SSE headers are committed. Instead: log
+                    # the verbatim upstream error and end the stream with an error
+                    # frame so the client sees a clean error, not a broken stream.
+                    err_bytes = await resp.aread()
+                    err_text = err_bytes.decode(errors="replace").strip()[:1000]
+                    logger.error(
+                        "[ollama] /api/chat %s: %s | model=%s tools=%d msgs=%d",
+                        resp.status_code,
+                        err_text,
+                        request.model,
+                        len(body.get("tools") or []),
+                        len(request.messages),
+                    )
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "error": {
+                                    "message": f"ollama /api/chat {resp.status_code}: {err_text}",
+                                    "type": "upstream_error",
+                                }
+                            }
+                        )
+                        + "\n\n"
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line:
@@ -492,9 +543,7 @@ class TracingService:
                                     "object": "chat.completion.chunk",
                                     "created": created,
                                     "model": request.model,
-                                    "choices": [
-                                        {"index": 0, "delta": {}, "finish_reason": finish}
-                                    ],
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
                                 }
                                 yield f"data: {json.dumps(data)}\n\n"
                             break
