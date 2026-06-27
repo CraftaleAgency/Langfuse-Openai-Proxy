@@ -611,12 +611,12 @@ async def openai_to_anthropic_stream(
                 )
                 buf["emitted_len"] += len(new_slice)
 
+        for evt in events:
+            yield evt
+
         if finish:
             state.finish_reason = finish
             break
-
-        for evt in events:
-            yield evt
 
     # Stream ended — close any open blocks and emit the terminal events.
     if not state.message_started:

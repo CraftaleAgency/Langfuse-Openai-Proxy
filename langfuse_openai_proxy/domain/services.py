@@ -94,20 +94,54 @@ def _build_ollama_native_body(model: str, messages: list, extra_params: dict) ->
     return body
 
 
+def _tool_args_to_str(args) -> str:
+    """Serialize Ollama tool_call arguments to the JSON string OpenAI expects.
+
+    Ollama's /api/chat returns function.arguments as a parsed dict/list, but the
+    OpenAI wire format (and our translator's input_json_delta path) expects a
+    JSON *string*. Passing the dict through verbatim makes the translator's
+    `buf["full_args"] += args_chunk` raise TypeError mid-stream.
+    """
+    if args is None:
+        return ""
+    if isinstance(args, str):
+        return args
+    return json.dumps(args)
+
+
 def _ollama_native_to_openai(model: str, resp: dict) -> dict:
     """Translate an Ollama /api/chat response to OpenAI chat-completion shape."""
     msg = resp.get("message", {}) or {}
     content = msg.get("content", "") or ""
     reasoning = msg.get("reasoning", "") or ""
+    tool_calls = msg.get("tool_calls") or []
     finish = "stop"
     if resp.get("done_reason") == "length":
         finish = "length"
-    elif resp.get("done_reason") == "tool_calls":
+    elif resp.get("done_reason") == "tool_calls" or tool_calls:
         finish = "tool_calls"
 
     message = {"role": msg.get("role", "assistant"), "content": content}
     if reasoning:
         message["reasoning"] = reasoning
+    if tool_calls:
+        # Surface Ollama's tool_calls in OpenAI shape so the Anthropic translator
+        # can emit tool_use blocks. Without this the native /api/chat path drops
+        # tool calls (finish_reason says tool_calls but the message carries none).
+        message["tool_calls"] = [
+            {
+                "id": tc.get("id") or f"call_{i}",
+                "type": "function",
+                "function": {
+                    "name": (tc.get("function") or {}).get("name", ""),
+                    "arguments": _tool_args_to_str((tc.get("function") or {}).get("arguments")),
+                },
+            }
+            for i, tc in enumerate(tool_calls)
+        ]
+        # OpenAI wants content: null when only tool_calls are present.
+        if not content:
+            message["content"] = None
 
     usage = {
         "prompt_tokens": resp.get("prompt_eval_count", 0) or 0,
@@ -397,16 +431,74 @@ class TracingService:
                     msg = chunk.get("message", {}) or {}
                     content = msg.get("content", "") or ""
                     reasoning = msg.get("reasoning", "") or ""
+                    tool_calls = msg.get("tool_calls") or []
                     if not content and reasoning and self._reasoning_as_content:
                         content = reasoning
-                    if not content and not reasoning:
-                        # Keep-alive or mid-stream empty delta; skip unless final.
+
+                    finish = None
+                    if chunk.get("done"):
+                        dr = chunk.get("done_reason")
+                        if dr == "length":
+                            finish = "length"
+                        elif dr == "tool_calls" or tool_calls:
+                            finish = "tool_calls"
+                        else:
+                            finish = "stop"
+
+                    # Tool calls: Ollama emits them on message.tool_calls with
+                    # empty content. Translate to OpenAI delta.tool_calls so the
+                    # Anthropic translator can emit tool_use blocks. Without this
+                    # the native stream path silently drops every tool call
+                    # (the empty-content branch below used to `continue` past them).
+                    if tool_calls:
+                        tc_deltas = []
+                        for i, tc in enumerate(tool_calls):
+                            fn = tc.get("function") or {}
+                            tc_deltas.append(
+                                {
+                                    "index": i,
+                                    "id": tc.get("id") or f"call_{i}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": fn.get("name", ""),
+                                        "arguments": _tool_args_to_str(fn.get("arguments")),
+                                    },
+                                }
+                            )
+                        data = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": request.model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"tool_calls": tc_deltas},
+                                    "finish_reason": finish,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
                         if chunk.get("done"):
                             break
                         continue
-                    finish = None
-                    if chunk.get("done"):
-                        finish = "length" if chunk.get("done_reason") == "length" else "stop"
+
+                    if not content and not reasoning:
+                        # Keep-alive or mid-stream empty delta; skip unless final.
+                        if chunk.get("done"):
+                            if finish is not None:
+                                data = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": request.model,
+                                    "choices": [
+                                        {"index": 0, "delta": {}, "finish_reason": finish}
+                                    ],
+                                }
+                                yield f"data: {json.dumps(data)}\n\n"
+                            break
+                        continue
                     data = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
