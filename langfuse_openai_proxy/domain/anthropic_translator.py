@@ -287,9 +287,11 @@ def openai_to_anthropic_response(
             }
         )
 
-    # Anthropic requires content to be a non-empty list; fall back to empty text.
+    # Anthropic requires content to be a non-empty list. If the model returned
+    # no content and no tool calls, emit a single short "(no output)" text block
+    # so the user sees a clear signal instead of a silent blank turn.
     if not content_blocks:
-        content_blocks.append({"type": "text", "text": ""})
+        content_blocks.append({"type": "text", "text": "(no output)"})
 
     usage = openai_resp.get("usage") or {}
     prompt_tokens = usage.get("prompt_tokens", 0)
@@ -532,6 +534,26 @@ async def openai_to_anthropic_stream(
             exhausted = True
             break
 
+        # Upstream error mid-stream (Ollama 4xx/5xx or connection failure from
+        # the native stream path, which emits it as a data frame since SSE
+        # headers are already committed). Emit a proper Anthropic `event: error`
+        # and terminate — do NOT fall through to the blank empty-stream fallback,
+        # which would mask the failure as an empty response and make Claude Code
+        # loop. Anthropic's overload stream is just the error event + close.
+        err = chunk.get("error")
+        if isinstance(err, dict):
+            yield _sse(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": err.get("type") or "overloaded_error",
+                        "message": err.get("message") or "upstream stream error",
+                    },
+                },
+            )
+            return
+
         # Carry usage/finish forward for the final message_delta.
         if chunk.get("usage"):
             state.usage = chunk["usage"]
@@ -620,13 +642,26 @@ async def openai_to_anthropic_stream(
 
     # Stream ended — close any open blocks and emit the terminal events.
     if not state.message_started:
-        # Empty stream (upstream errored or yielded nothing). Emit a minimal
-        # well-formed Anthropic stream so the client doesn't hang.
+        # Empty stream: upstream yielded no content and no tool calls (e.g. a
+        # small model that stopped immediately, max_tokens=0, or a stop sequence
+        # matched at the start). Emit a single short text block with a clear
+        # "(no output)" signal so the user sees something instead of a silent
+        # blank turn — a blank assistant message makes Claude Code loop
+        # fruitlessly retrying for real output.
         yield _ensure_started()
         opened = _open_text_block()
         if opened is not None:
             idx, start_evt = opened
             yield start_evt
+            yield _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": "(no output)"},
+                },
+            )
+            state.output_chars += len("(no output)")
 
     # Close all open blocks in index order.
     for idx in sorted(state.open_blocks.keys()):

@@ -277,6 +277,23 @@ def _ollama_native_to_openai(model: str, resp: dict) -> dict:
     }
 
 
+def _anthropic_err_type(status_code: int) -> str:
+    """Map an upstream HTTP status to an Anthropic error type.
+
+    The streaming native path can't raise (SSE headers are committed by the
+    time an upstream error arrives), so it emits the error as a data frame the
+    Anthropic translator turns into an ``event: error``. The type drives Claude
+    Code's error-class selection, so a 429 surfaces as rate_limit_error etc.
+    Mirrors api/error_handlers._error_type_for_status without crossing the
+    domain→api layer boundary.
+    """
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code >= 500:
+        return "overloaded_error"
+    return "invalid_request_error"
+
+
 def _apply_max_tokens_floor(extra_params: dict | None, floor: int | None) -> dict:
     """Inject or raise `max_tokens` so reasoning models don't get starved.
 
@@ -578,14 +595,15 @@ class TracingService:
                         + json.dumps(
                             {
                                 "error": {
-                                    "message": f"ollama /api/chat {resp.status_code}: {err_text}",
-                                    "type": "upstream_error",
+                                    "type": _anthropic_err_type(resp.status_code),
+                                    "message": (
+                                        f"ollama /api/chat {resp.status_code}: {err_text}"
+                                    ),
                                 }
                             }
                         )
                         + "\n\n"
                     )
-                    yield "data: [DONE]\n\n"
                     return
                 async for line in resp.aiter_lines():
                     line = line.strip()
@@ -690,13 +708,14 @@ class TracingService:
                 + json.dumps(
                     {
                         "error": {
+                            "type": "overloaded_error",
                             "message": "Ollama native endpoint unreachable",
-                            "type": "upstream_connection_error",
                         }
                     }
                 )
                 + "\n\n"
             )
+            return
 
         yield "data: [DONE]\n\n"
 

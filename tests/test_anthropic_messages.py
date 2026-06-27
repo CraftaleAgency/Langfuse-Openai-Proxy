@@ -24,6 +24,7 @@ import pytest
 from langfuse_openai_proxy.api import anthropic_routes
 from langfuse_openai_proxy.api.app import create_app
 from langfuse_openai_proxy.api.dependencies import get_settings
+from langfuse_openai_proxy.domain.errors import UpstreamError
 from langfuse_openai_proxy.domain.models import ChatRequest, Credentials
 from langfuse_openai_proxy.infrastructure.config import Settings
 
@@ -54,6 +55,21 @@ class FakeTracingService:
     ) -> dict[str, Any]:
         self.captured_requests.append(request)
         self.captured_apply_floor.append(apply_max_tokens_floor)
+        if self.behavior == "empty":
+            # Model returned no content and no tool calls.
+            return {
+                "id": "chatcmpl-empty",
+                "choices": [
+                    {"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5},
+            }
+        if self.behavior == "raise_upstream_4xx":
+            raise UpstreamError("bad tool schema", status_code=400)
+        if self.behavior == "raise_upstream_429":
+            raise UpstreamError("slow down", status_code=429)
+        if self.behavior == "raise_upstream_5xx":
+            raise UpstreamError("boom", status_code=500)
         if self.behavior == "thinking":
             # Thinking-model non-streaming response: reasoning separated from content.
             return {
@@ -115,6 +131,26 @@ class FakeTracingService:
     ) -> AsyncIterator[str]:
         self.captured_requests.append(request)
         self.captured_apply_floor.append(apply_max_tokens_floor)
+        if self.behavior == "stream_error":
+            # Upstream 4xx mid-stream: native path emits it as a data frame.
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "ollama /api/chat 400: bad tool",
+                        }
+                    }
+                )
+                + "\n\n"
+            )
+            yield "data: [DONE]\n\n"
+            return
+        if self.behavior == "stream_empty":
+            # Upstream yielded nothing — model stopped with no content.
+            yield "data: [DONE]\n\n"
+            return
         if self.behavior == "stream_thinking":
             # Ollama thinking-model stream: reasoning phase (delta.reasoning)
             # then content phase (delta.content).
@@ -944,5 +980,169 @@ async def test_streaming_no_thinking_has_zero_thinking_tokens(client_factory):
         # message_delta has thinking_tokens: 0 (no reasoning in stream).
         md = [e for et, e in events if et == "message_delta"][0]
         assert md["usage"]["output_tokens_details"]["thinking_tokens"] == 0
+    finally:
+        await client.aclose()
+
+
+# --- Error envelopes (WS2a) --------------------------------------------------
+
+
+def _msg_body(stream: bool = False) -> dict:
+    return {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 100,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_auth_error_is_anthropic_envelope(client_factory):
+    """A bad token returns the Anthropic envelope, not {"detail": ...}."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="text")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": "wrong", "content-type": "application/json"},
+            json=_msg_body(),
+        )
+        assert resp.status_code == 401
+        body = resp.json()
+        assert body["type"] == "error"
+        assert body["error"]["type"] == "authentication_error"
+        assert "message" in body["error"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_upstream_4xx_error_envelope(client_factory):
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="raise_upstream_4xx")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(),
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body == {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "bad tool schema"},
+        }
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_upstream_429_error_envelope(client_factory):
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="raise_upstream_429")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(),
+        )
+        assert resp.status_code == 429
+        assert resp.json()["error"]["type"] == "rate_limit_error"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_upstream_5xx_error_envelope(client_factory):
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="raise_upstream_5xx")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(),
+        )
+        assert resp.status_code == 500
+        assert resp.json()["error"]["type"] == "overloaded_error"
+    finally:
+        await client.aclose()
+
+
+# --- Streaming error frame (WS2b) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streaming_upstream_error_emits_anthropic_error_event(client_factory):
+    """A mid-stream upstream error becomes an Anthropic `event: error`, not a blank."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="stream_error")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(stream=True),
+        )
+        assert resp.status_code == 200
+        events = await _read_sse_stream(resp)
+        err_events = [e for et, e in events if et == "error"]
+        assert len(err_events) == 1
+        assert err_events[0]["type"] == "error"
+        assert err_events[0]["error"]["type"] == "invalid_request_error"
+        assert "ollama /api/chat 400" in err_events[0]["error"]["message"]
+        # An errored stream must not emit the success terminal events.
+        types = [et for et, _ in events]
+        assert "message_start" not in types
+        assert "message_stop" not in types
+    finally:
+        await client.aclose()
+
+
+# --- Empty-output safeguard (WS2c) ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streaming_empty_emits_no_output_safeguard(client_factory):
+    """An empty upstream stream surfaces a clear '(no output)' instead of a blank."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="stream_empty")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(stream=True),
+        )
+        assert resp.status_code == 200
+        events = await _read_sse_stream(resp)
+        text_deltas = [
+            e["delta"]["text"]
+            for et, e in events
+            if et == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta"
+        ]
+        assert "".join(text_deltas) == "(no output)"
+        # Still a well-formed terminal sequence.
+        types = [et for et, _ in events]
+        assert types[0] == "message_start"
+        assert types[-1] == "message_stop"
+        md = [e for et, e in events if et == "message_delta"][0]
+        assert md["delta"]["stop_reason"] == "end_turn"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_empty_emits_no_output_safeguard(client_factory):
+    """An empty non-streaming response surfaces '(no output)' instead of blank text."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="empty")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["content"] == [{"type": "text", "text": "(no output)"}]
+        assert body["stop_reason"] == "end_turn"
     finally:
         await client.aclose()

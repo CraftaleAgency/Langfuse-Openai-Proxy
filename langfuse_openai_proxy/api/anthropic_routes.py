@@ -250,6 +250,27 @@ async def create_message(
                                 stop_reason = (parsed.get("delta") or {}).get("stop_reason")
                                 usage_seen = parsed.get("usage")
                     yield evt
+            except Exception as e:
+                # SSE headers are committed by the time the translator runs, so
+                # an exception (e.g. the OpenAI-compat stream path raising on an
+                # upstream error, or a translator bug) can't become a clean HTTP
+                # error response. Emit an Anthropic error event so Claude Code
+                # shows a clean error instead of a truncated/broken stream.
+                logger.warning("[shim] stream error: %s", e)
+                yield (
+                    "event: error\n"
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "overloaded_error",
+                                "message": f"stream error: {e}",
+                            },
+                        }
+                    )
+                    + "\n\n"
+                )
             finally:
                 # Explicitly close the upstream generators. The translator breaks
                 # out as soon as it sees finish_reason, leaving stream_chat_completion
