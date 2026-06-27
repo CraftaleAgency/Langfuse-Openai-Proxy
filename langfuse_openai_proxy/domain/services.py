@@ -12,6 +12,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
@@ -61,6 +62,95 @@ def _wants_ollama_native(extra_params: dict | None) -> bool:
     return bool(extra_params.get("ollama_native"))
 
 
+# JSON-Schema structural keywords llama.cpp's json_schema_to_grammar either
+# rejects or can't resolve. Dropping them keeps a schema inside Ollama's
+# supported subset. Semantic hints (description/format/enum/bounds) are kept —
+# the grammar compiler ignores them, so they cost nothing and aid the model.
+_OLLAMA_SCHEMA_DROP_KEYS = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "$comment",
+        "patternProperties",
+        "dependencies",
+        "dependentRequired",
+        "dependentSchemas",
+    }
+)
+
+
+def _sanitize_json_schema(schema: Any) -> Any:
+    """Coerce a JSON schema into the subset Ollama (llama.cpp) accepts.
+
+    Ollama compiles each tool's parameter schema into a grammar via
+    ``json_schema_to_grammar``. Several standard JSON-Schema constructs make
+    that compiler bail with a generic ``"Value looks like object, but can't
+    find closing '}' symbol"`` 400 — most notably object-valued
+    ``additionalProperties``, plus unions (``anyOf``/``oneOf``/``allOf``) and
+    ``$ref``/``$defs``. A single offending tool in a 500+ entry Claude Code
+    manifest poisons the whole request, so every schema is normalized before
+    it reaches /api/chat.
+    """
+    if isinstance(schema, list):
+        return [_sanitize_json_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in _OLLAMA_SCHEMA_DROP_KEYS:
+            continue
+        if key == "additionalProperties":
+            # Object-valued additionalProperties is the #1 trigger for Ollama's
+            # unbalanced-brace grammar error — only a bare bool is supported.
+            out[key] = value is True
+            continue
+        if key in ("anyOf", "oneOf"):
+            # Ollama's union support is fragile; collapse to the first branch.
+            if isinstance(value, list) and value:
+                first = _sanitize_json_schema(value[0])
+                if isinstance(first, dict):
+                    out.update(first)
+            continue
+        if key == "allOf":
+            if isinstance(value, list):
+                for branch in value:
+                    sane = _sanitize_json_schema(branch)
+                    if isinstance(sane, dict):
+                        out.update(sane)
+            continue
+        if key == "type" and isinstance(value, list):
+            # type: ["string", "null"] etc. — keep the first option.
+            out[key] = value[0] if value else "string"
+            continue
+        if key == "properties" and isinstance(value, dict):
+            out[key] = {name: _sanitize_json_schema(sub) for name, sub in value.items()}
+            continue
+        if key == "items":
+            out[key] = _sanitize_json_schema(value)
+            continue
+        out[key] = value
+    return out
+
+
+def _sanitize_tool_for_ollama(tool: Any) -> Any:
+    """Normalize one OpenAI-shape tool's parameter schema for Ollama."""
+    if not isinstance(tool, dict):
+        return tool
+    out = dict(tool)
+    fn = out.get("function")
+    if isinstance(fn, dict):
+        fn = dict(fn)
+        params = fn.get("parameters")
+        if isinstance(params, dict):
+            fn["parameters"] = _sanitize_json_schema(params)
+        out["function"] = fn
+    return out
+
+
 def _build_ollama_native_body(model: str, messages: list, extra_params: dict) -> dict:
     """Translate an OpenAI chat request to Ollama's native /api/chat format."""
     body: dict = {
@@ -93,7 +183,13 @@ def _build_ollama_native_body(model: str, messages: list, extra_params: dict) ->
     # Pass through any Ollama-native keys the caller knows about.
     for k in ("format", "keep_alive", "seed", "tools", "tool_choice"):
         if k in extra_params:
-            body[k] = extra_params[k]
+            value = extra_params[k]
+            if k == "tools" and isinstance(value, list):
+                # Normalize each tool's parameter schema to Ollama's JSON-Schema
+                # subset — otherwise one unsupported construct in a 500+ tool
+                # manifest 400s the whole request. See _sanitize_json_schema.
+                value = [_sanitize_tool_for_ollama(t) for t in value]
+            body[k] = value
 
     return body
 
