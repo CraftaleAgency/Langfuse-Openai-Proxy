@@ -625,6 +625,11 @@ class TracingService:
                     len(body.get("tools") or []),
                     len(request.messages),
                 )
+                with (
+                    contextlib.suppress(Exception),
+                    open(f"/tmp/ollama_bad_body_{int(time.time())}.json", "w") as f,
+                ):
+                    json.dump(body, f)
                 raise UpstreamError(
                     f"ollama /api/chat {e.response.status_code}: {err_text}",
                     status_code=e.response.status_code,
@@ -690,11 +695,15 @@ class TracingService:
                             len(body.get("tools") or []),
                             len(request.messages),
                         )
+                        # Dump the FULL body (tools + messages + options) so the exact
+                        # failing payload can be replayed offline. Tools-only dumps proved
+                        # insufficient: the 400 only reproduces with the real multi-turn
+                        # context, not synthetic messages.
                         with (
                             contextlib.suppress(Exception),
-                            open(f"/tmp/ollama_bad_tools_{int(time.time())}.json", "w") as f,
+                            open(f"/tmp/ollama_bad_body_{int(time.time())}.json", "w") as f,
                         ):
-                            json.dump(body.get("tools") or [], f)
+                            json.dump(body, f)
                         yield (
                             "data: "
                             + json.dumps(
