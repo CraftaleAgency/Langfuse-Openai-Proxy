@@ -86,8 +86,32 @@ _OLLAMA_SCHEMA_DROP_KEYS = frozenset(
         "then",
         "else",
         "not",
+        # Content keywords are validation-only hints the grammar compiler
+        # ignores at best and chokes on at worst (contentSchema with an object
+        # value is a documented "can't find closing '}'" trigger). They convey
+        # no grammar information, so dropping them is lossless for tool-calling.
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
     }
 )
+
+
+def _const_to_enum(value: Any) -> dict[str, Any]:
+    """Rewrite ``const: X`` to the grammar-safe ``enum: [X]`` form.
+
+    llama.cpp's json_schema_to_grammar has a long history of mishandling
+    ``const`` — it must emit a literal-matching rule, and for object/array
+    values (or under certain schema sizes) the emitted grammar is malformed,
+    producing the generic ``"Value looks like object, but can't find closing
+    '}' symbol"`` 400. ``enum`` with a single element is semantically
+    identical (the schema pins the value to one option) and is reliably
+    compiled because it reuses the well-tested enum path.
+
+    The const value is an arbitrary JSON instance (not a schema), so it is
+    passed through verbatim — no recursive sanitization of its contents.
+    """
+    return {"enum": [value]}
 
 
 def _sanitize_json_schema(schema: Any) -> Any:
@@ -97,10 +121,11 @@ def _sanitize_json_schema(schema: Any) -> Any:
     ``json_schema_to_grammar``. Several standard JSON-Schema constructs make
     that compiler bail with a generic ``"Value looks like object, but can't
     find closing '}' symbol"`` 400 — most notably object-valued
-    ``additionalProperties``, plus unions (``anyOf``/``oneOf``/``allOf``) and
-    ``$ref``/``$defs``. A single offending tool in a 500+ entry Claude Code
-    manifest poisons the whole request, so every schema is normalized before
-    it reaches /api/chat.
+    ``additionalProperties``, ``const`` (which the compiler turns into a
+    literal rule that can malformed under certain conditions), and unions
+    (``anyOf``/``oneOf``/``allOf``) plus ``$ref``/``$defs``. A single
+    offending tool in a 500+ entry Claude Code manifest poisons the whole
+    request, so every schema is normalized before it reaches /api/chat.
     """
     if isinstance(schema, list):
         return [_sanitize_json_schema(item) for item in schema]
@@ -115,6 +140,32 @@ def _sanitize_json_schema(schema: Any) -> Any:
             # Object-valued additionalProperties is the #1 trigger for Ollama's
             # unbalanced-brace grammar error — only a bare bool is supported.
             out[key] = value is True
+            continue
+        if key == "const":
+            # const emits a literal-matching grammar rule that llama.cpp
+            # mishandles under certain conditions (object/array values, large
+            # manifest sizes). Rewrite to enum:[X] which is semantically
+            # identical and uses the well-tested enum code path. Merge into any
+            # pre-existing enum to avoid producing an invalid two-keyword node.
+            enum_form = _const_to_enum(value)
+            if "enum" in out:
+                # Replace the enum with the const-pin (const is stricter, but
+                # this collision is extraordinarily rare in tool schemas).
+                out["enum"] = enum_form["enum"]
+            else:
+                out.update(enum_form)
+            continue
+        if key in ("exclusiveMinimum", "exclusiveMaximum"):
+            # Draft-07 treats these as numbers; Draft-2020-12 changed them to
+            # {value: N} objects. llama.cpp's support is version-dependent and
+            # has produced grammar errors. Convert to the inclusive bound
+            # (slightly looser but grammar-safe): exclusiveMinimum:5 → minimum:5.
+            # For the object form, extract .value.
+            num = value.get("value") if isinstance(value, dict) else value
+            if isinstance(num, (int, float)):
+                bound_key = "minimum" if key == "exclusiveMinimum" else "maximum"
+                # Don't clobber an explicit inclusive bound the author already set.
+                out.setdefault(bound_key, num)
             continue
         if key in ("anyOf", "oneOf"):
             # Ollama's union support is fragile; collapse to the first branch.
@@ -596,9 +647,7 @@ class TracingService:
                             {
                                 "error": {
                                     "type": _anthropic_err_type(resp.status_code),
-                                    "message": (
-                                        f"ollama /api/chat {resp.status_code}: {err_text}"
-                                    ),
+                                    "message": (f"ollama /api/chat {resp.status_code}: {err_text}"),
                                 }
                             }
                         )

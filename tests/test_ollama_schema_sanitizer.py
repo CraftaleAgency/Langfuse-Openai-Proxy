@@ -147,3 +147,135 @@ def test_conditional_and_prefix_keywords_dropped():
     out = _sanitize_json_schema(schema)
     for dropped in ("prefixItems", "propertyNames", "if", "then", "else", "not"):
         assert dropped not in out
+
+
+# --- const / exclusiveMinimum / content* hardening ---
+# These keywords are documented llama.cpp grammar-compile offenders that
+# produce the generic "can't find closing '}'" 400. Each test asserts the
+# construct is neutralized to a grammar-safe equivalent.
+
+
+def test_string_const_rewritten_to_enum():
+    # const is the textbook "can't find closing '}'" trigger; enum:[X] is the
+    # semantically-identical, grammar-safe form.
+    schema = {"type": "object", "properties": {"kind": {"const": "cloud"}}}
+    out = _sanitize_json_schema(schema)
+    prop = out["properties"]["kind"]
+    assert "const" not in prop
+    assert prop["enum"] == ["cloud"]
+
+
+def test_number_const_rewritten_to_enum():
+    schema = {"type": "object", "properties": {"n": {"const": 42}}}
+    out = _sanitize_json_schema(schema)
+    assert out["properties"]["n"]["enum"] == [42]
+
+
+def test_boolean_const_rewritten_to_enum():
+    schema = {"type": "object", "properties": {"flag": {"const": True}}}
+    out = _sanitize_json_schema(schema)
+    assert out["properties"]["flag"]["enum"] == [True]
+
+
+def test_null_const_rewritten_to_enum():
+    schema = {"type": "object", "properties": {"x": {"const": None}}}
+    out = _sanitize_json_schema(schema)
+    assert out["properties"]["x"]["enum"] == [None]
+
+
+def test_object_const_rewritten_to_enum():
+    # Object-valued const is the worst-case llama.cpp trigger; the value is an
+    # arbitrary JSON instance (not a schema), so it passes through verbatim as
+    # the single enum element. The const keyword is removed.
+    schema = {
+        "type": "object",
+        "properties": {"cfg": {"const": {"a": 1, "b": [1, 2, 3]}}},
+    }
+    out = _sanitize_json_schema(schema)
+    assert out["properties"]["cfg"]["enum"] == [{"a": 1, "b": [1, 2, 3]}]
+    assert "const" not in out["properties"]["cfg"]
+
+
+def test_const_collision_with_existing_enum_prefers_const_pin():
+    # If a schema (unusually) declares both const and enum, const is stricter;
+    # keep the const-pin rather than emitting an invalid two-keyword node.
+    schema = {"enum": ["a", "b"], "const": "b"}
+    out = _sanitize_json_schema(schema)
+    assert out["enum"] == ["b"]
+    assert "const" not in out
+
+
+def test_exclusive_minimum_number_form_converted_to_inclusive():
+    # Draft-07: exclusiveMinimum: 0 → minimum: 0 (grammar-safe, slightly looser).
+    schema = {"type": "integer", "exclusiveMinimum": 0}
+    out = _sanitize_json_schema(schema)
+    assert "exclusiveMinimum" not in out
+    assert out["minimum"] == 0
+
+
+def test_exclusive_maximum_number_form_converted_to_inclusive():
+    schema = {"type": "integer", "exclusiveMaximum": 100}
+    out = _sanitize_json_schema(schema)
+    assert "exclusiveMaximum" not in out
+    assert out["maximum"] == 100
+
+
+def test_exclusive_minimum_object_form_extracted():
+    # Draft-2020-12: exclusiveMinimum: {value: 0} → minimum: 0.
+    schema = {"type": "integer", "exclusiveMinimum": {"value": 5}}
+    out = _sanitize_json_schema(schema)
+    assert "exclusiveMinimum" not in out
+    assert out["minimum"] == 5
+
+
+def test_exclusive_minimum_does_not_clobber_explicit_inclusive_bound():
+    # If the author already set an explicit minimum, don't overwrite it.
+    schema = {"type": "integer", "minimum": 10, "exclusiveMinimum": 0}
+    out = _sanitize_json_schema(schema)
+    assert out["minimum"] == 10
+    assert "exclusiveMinimum" not in out
+
+
+def test_content_keywords_dropped():
+    # contentEncoding/contentMediaType/contentSchema are validation-only hints
+    # the grammar compiler ignores at best and chokes on at worst
+    # (contentSchema with an object value is a known offender).
+    schema = {
+        "type": "string",
+        "contentEncoding": "base64",
+        "contentMediaType": "image/png",
+        "contentSchema": {"type": "object", "properties": {"x": {"type": "string"}}},
+    }
+    out = _sanitize_json_schema(schema)
+    for dropped in ("contentEncoding", "contentMediaType", "contentSchema"):
+        assert dropped not in out
+    assert out["type"] == "string"
+
+
+def test_nested_const_in_items_rewritten():
+    schema = {"type": "array", "items": {"const": "fixed"}}
+    out = _sanitize_json_schema(schema)
+    assert out["items"]["enum"] == ["fixed"]
+    assert "const" not in out["items"]
+
+
+def test_full_registry_tool_sanitizes_cleanly():
+    # Regression: the real Dokploy registry-create tool pins registryType via
+    # const:"cloud". After sanitization it must reach Ollama as enum:["cloud"].
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "registry-create",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "registryType": {"const": "cloud"},
+                    "imagePrefix": {"type": "string"},
+                },
+            },
+        },
+    }
+    out = _sanitize_tool_for_ollama(tool)
+    params = out["function"]["parameters"]
+    assert params["properties"]["registryType"]["enum"] == ["cloud"]
+    assert "const" not in params["properties"]["registryType"]
