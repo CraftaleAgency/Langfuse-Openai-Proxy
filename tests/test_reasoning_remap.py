@@ -195,3 +195,77 @@ async def test_remap_does_not_overwrite_existing_content():
     )
 
     assert events[0]["choices"][0]["delta"]["content"] == "real"
+
+
+@pytest.mark.asyncio
+async def test_remap_per_request_override_disables_fold():
+    """A per-request override (X-Reasoning-As-Content: false) disables the fold
+    even when the service default is fold-ON. Reasoning stays in its own field
+    so a reasoning-aware client (Odysseus) gets a populated thinking panel and a
+    clean content stream, without affecting the global fold other clients rely on."""
+    chunks = [
+        _make_chunk(content="", reasoning="thinking"),
+        _make_chunk(content="answer", reasoning=None, finish_reason="stop"),
+    ]
+    # Service default: fold ON (as if REASONING_AS_CONTENT=true globally).
+    service = _make_service(reasoning_as_content=True, chunks=chunks)
+
+    events = _parse_sse_events(
+        [
+            chunk
+            async for chunk in service.stream_chat_completion(
+                _CREDENTIALS, _REQUEST, "host", reasoning_as_content=False
+            )
+        ]
+    )
+
+    # Override wins over the service default: reasoning is NOT copied into content.
+    assert events[0]["choices"][0]["delta"]["content"] == ""
+    assert events[0]["choices"][0]["delta"]["reasoning"] == "thinking"
+    assert events[1]["choices"][0]["delta"]["content"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_remap_per_request_override_enables_fold():
+    """The inverse: override=true forces the fold even when the service default
+    is fold-OFF (e.g. a content-only client talking to a proxy whose global
+    default left the fold off)."""
+    chunks = [
+        _make_chunk(content="", reasoning="thinking"),
+        _make_chunk(content="answer", reasoning=None, finish_reason="stop"),
+    ]
+    service = _make_service(reasoning_as_content=False, chunks=chunks)
+
+    events = _parse_sse_events(
+        [
+            chunk
+            async for chunk in service.stream_chat_completion(
+                _CREDENTIALS, _REQUEST, "host", reasoning_as_content=True
+            )
+        ]
+    )
+
+    assert events[0]["choices"][0]["delta"]["content"] == "thinking"
+    assert events[0]["choices"][0]["delta"]["reasoning"] == ""
+    assert events[1]["choices"][0]["delta"]["content"] == "answer"
+
+
+@pytest.mark.asyncio
+async def test_remap_no_override_keeps_service_default():
+    """reasoning_as_content=None (header absent) falls back to the service default."""
+    chunks = [_make_chunk(content="", reasoning="thinking")]
+    # Default OFF → no fold.
+    service_off = _make_service(reasoning_as_content=False, chunks=chunks)
+    events_off = _parse_sse_events(
+        [c async for c in service_off.stream_chat_completion(_CREDENTIALS, _REQUEST, "host")]
+    )
+    assert events_off[0]["choices"][0]["delta"]["reasoning"] == "thinking"
+    assert events_off[0]["choices"][0]["delta"]["content"] == ""
+
+    # Default ON → fold (None override must not change that).
+    service_on = _make_service(reasoning_as_content=True, chunks=chunks)
+    events_on = _parse_sse_events(
+        [c async for c in service_on.stream_chat_completion(_CREDENTIALS, _REQUEST, "host")]
+    )
+    assert events_on[0]["choices"][0]["delta"]["content"] == "thinking"
+    assert events_on[0]["choices"][0]["delta"]["reasoning"] == ""

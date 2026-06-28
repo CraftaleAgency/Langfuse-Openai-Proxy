@@ -131,12 +131,33 @@ async def get_model(
     return {"error": {"message": f"Model {model} not found"}}
 
 
+def _parse_reasoning_as_content(value: str | None) -> bool | None:
+    """Parse the X-Reasoning-As-Content header into a tri-state bool.
+
+    True/False forces fold-on/fold-off for this one request; None (header
+    absent or unrecognized) falls back to the service default
+    (Settings.reasoning_as_content). A reasoning-aware client sends ``false``
+    to receive reasoning in its own SSE field instead of folded into content,
+    so its thinking panel is populated and the answer stream stays clean —
+    without affecting content-only clients that rely on the global fold.
+    """
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(
     request: Request,
     authorization: str | None = Header(None),
     x_langfuse_public_key: str | None = Header(None, alias="X-Langfuse-Public-Key"),
     x_langfuse_host: str | None = Header(None, alias="X-Langfuse-Host"),
+    x_reasoning_as_content: str | None = Header(None, alias="X-Reasoning-As-Content"),
     tracing_service: TracingService = Depends(get_tracing_service),
     settings: Settings = Depends(get_settings),
 ):
@@ -146,6 +167,8 @@ async def chat_completions(
     raw_host = x_langfuse_host or settings.langfuse_default_host
     # Security: validate user-supplied host to prevent SSRF / credential exfiltration
     host = validate_langfuse_host(raw_host) if x_langfuse_host else raw_host
+    # Per-request reasoning-fold override (see _parse_reasoning_as_content).
+    reasoning_override = _parse_reasoning_as_content(x_reasoning_as_content)
 
     body = await request.json()
     model = body.get("model", "")
@@ -161,12 +184,16 @@ async def chat_completions(
 
     if stream:
         return StreamingResponse(
-            tracing_service.stream_chat_completion(credentials, chat_request, host),
+            tracing_service.stream_chat_completion(
+                credentials, chat_request, host, reasoning_as_content=reasoning_override
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    return await tracing_service.chat_completion(credentials, chat_request, host)
+    return await tracing_service.chat_completion(
+        credentials, chat_request, host, reasoning_as_content=reasoning_override
+    )
 
 
 @router.post("/v1/embeddings")

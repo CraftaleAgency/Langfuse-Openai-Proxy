@@ -519,8 +519,16 @@ class TracingService:
         request: ChatRequest,
         host: str,
         apply_max_tokens_floor: bool = True,
+        reasoning_as_content: bool | None = None,
     ) -> dict:
         """Execute non-streaming chat completion with Langfuse tracing."""
+        # Per-request override (X-Reasoning-As-Content header) wins over the
+        # global default; None keeps Settings.reasoning_as_content. Lets a
+        # reasoning-aware client receive reasoning in its own field instead of
+        # folded into content (the default serves content-only clients).
+        reasoning_as_content = (
+            self._reasoning_as_content if reasoning_as_content is None else reasoning_as_content
+        )
         # Apply max_tokens floor before any routing decision — both the native
         # /api/chat path and the OpenAI-compat /v1 path read max_tokens from
         # extra_params. See _apply_max_tokens_floor(). The Anthropic shim path
@@ -606,7 +614,7 @@ class TracingService:
 
         # Non-stream remap: same reasoning → content fallback as the streaming
         # path, for clients that only read `message.content`.
-        if self._reasoning_as_content:
+        if reasoning_as_content:
             for choice in data.get("choices", []):
                 message = choice.get("message")
                 if isinstance(message, dict) and not message.get("content"):
@@ -690,8 +698,15 @@ class TracingService:
         payload = resp.json()
         return _ollama_native_to_openai(request.model, payload)
 
-    async def _ollama_native_stream(self, request: ChatRequest) -> AsyncGenerator[str, None]:
+    async def _ollama_native_stream(
+        self,
+        request: ChatRequest,
+        reasoning_as_content: bool | None = None,
+    ) -> AsyncGenerator[str, None]:
         """Stream from Ollama's native /api/chat in OpenAI SSE shape."""
+        reasoning_as_content = (
+            self._reasoning_as_content if reasoning_as_content is None else reasoning_as_content
+        )
         http = get_http_client()
         base = _ollama_native_base_url(self._upstream_base_url)
         url = f"{base}/api/chat"
@@ -780,7 +795,7 @@ class TracingService:
                         content = msg.get("content", "") or ""
                         reasoning = msg.get("reasoning", "") or ""
                         tool_calls = msg.get("tool_calls") or []
-                        if not content and reasoning and self._reasoning_as_content:
+                        if not content and reasoning and reasoning_as_content:
                             content = reasoning
 
                         finish = None
@@ -890,11 +905,17 @@ class TracingService:
         request: ChatRequest,
         host: str,
         apply_max_tokens_floor: bool = True,
+        reasoning_as_content: bool | None = None,
     ) -> AsyncGenerator[str, None]:
         """Execute streaming chat completion with Langfuse tracing.
 
         Yields SSE-formatted chunks. Collects content for tracing after stream ends.
         """
+        # Per-request override (X-Reasoning-As-Content header) wins over the
+        # global default; None keeps Settings.reasoning_as_content.
+        reasoning_as_content = (
+            self._reasoning_as_content if reasoning_as_content is None else reasoning_as_content
+        )
         # Apply max_tokens floor before any routing decision — see chat_completion().
         # The Anthropic shim path passes apply_max_tokens_floor=False.
         if apply_max_tokens_floor:
@@ -930,7 +951,9 @@ class TracingService:
         if _wants_ollama_native(request.extra_params):
             collected_content = []
             try:
-                async for sse_chunk in self._ollama_native_stream(request):
+                async for sse_chunk in self._ollama_native_stream(
+                    request, reasoning_as_content=reasoning_as_content
+                ):
                     yield sse_chunk
                     # Pull the delta text back out for tracing. Format matches
                     # what _ollama_native_stream emits.
@@ -976,7 +999,7 @@ class TracingService:
                 # Ollama's /v1 endpoint streams reasoning-model output in
                 # `delta.reasoning` with `delta.content` empty; without this,
                 # such clients see an empty stream and abort (stop_reason=length).
-                if self._reasoning_as_content and data.get("choices"):
+                if reasoning_as_content and data.get("choices"):
                     for choice in data["choices"]:
                         delta = choice.get("delta")
                         if not isinstance(delta, dict):
