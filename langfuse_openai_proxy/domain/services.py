@@ -613,6 +613,9 @@ class TracingService:
                     reasoning = message.get("reasoning")
                     if reasoning:
                         message["content"] = reasoning
+                        # Clear `reasoning` — see the streaming path: leaving it
+                        # set hands reasoning-aware clients the same text twice.
+                        message["reasoning"] = ""
 
         return data
 
@@ -981,6 +984,13 @@ class TracingService:
                         reasoning = delta.get("reasoning")
                         if reasoning and not delta.get("content"):
                             delta["content"] = reasoning
+                            # Clear `reasoning` so a reasoning-aware client
+                            # doesn't receive the same token in BOTH fields —
+                            # that double-renders every thinking token (once in
+                            # its thinking panel, once in the answer). The fold
+                            # is for content-only clients; once we've copied it
+                            # over, the reasoning stream must go silent.
+                            delta["reasoning"] = ""
                             # Reflect the remapped text in tracing too.
                             collected_content.append(reasoning)
 

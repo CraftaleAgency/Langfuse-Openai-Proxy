@@ -174,9 +174,10 @@ async def test_remap_enabled_copies_reasoning_into_content():
         [chunk async for chunk in service.stream_chat_completion(_CREDENTIALS, _REQUEST, "host")]
     )
 
-    # reasoning copied into content; reasoning field preserved too
+    # reasoning copied into content AND cleared, so reasoning-aware clients
+    # don't receive the same token in both fields (which double-renders it).
     assert events[0]["choices"][0]["delta"]["content"] == "thinking"
-    assert events[0]["choices"][0]["delta"]["reasoning"] == "thinking"
+    assert events[0]["choices"][0]["delta"]["reasoning"] == ""
     # native content chunk is NOT overwritten when content is already present
     assert events[1]["choices"][0]["delta"]["content"] == "answer"
 
