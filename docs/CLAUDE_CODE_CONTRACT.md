@@ -235,6 +235,7 @@ upstream status), `ProxyError` (400), `ValueError` (400), and `HTTPException`
 | Tool-schema sanitizer for Ollama grammar | `_sanitize_json_schema` (`services.py:93`) drops unsupported JSON-Schema keywords per tool | High | **Fixed** |
 | Tool-call surfacing on native `/api/chat` | `_ollama_native_to_openai` (`:224`) and the native streamer (`:638`) emit OpenAI `tool_calls` | High | **Fixed** |
 | `stop_reason="tool_use"` when a tool_use block is emitted | Translator overrides to `tool_use` regardless of Ollama's trailing `done_reason` (gemma splits the tool_call and done chunks) (`anthropic_translator.py:688`) | High | **Fixed** |
+| Keep the connection alive through Ollama's prompt-eval silence | Ping heartbeat now fires *before* `message_start` too (`anthropic_translator.py:529`), so a byte flows every ~15s during eval — without it, a full-tool opus turn (eval >120s on a 12B) emits nothing and a Cloudflare front-end 524s at its 120s read timeout | High | **Fixed** |
 | `thinking` field passthrough | Forced off via `ANTHROPIC_SHIM_THINK=false` default; gemma thinks by default regardless. Revisit if Claude Code sends `thinking:enabled` and quality suffers | Med | **Documented** |
 | Prompt-cache token accounting | `cache_creation_input_tokens` / `cache_read_input_tokens` always `0`; no real cache upstream | Low | **Out-of-scope** (cosmetic) |
 | Conversation-quality ceiling | Bound by 4–12B open models; see `MODELS.md` tiering | Med | **Capability-bound** (not a proxy bug) |
