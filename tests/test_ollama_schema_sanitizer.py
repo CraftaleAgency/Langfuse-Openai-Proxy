@@ -144,55 +144,149 @@ def _make_tool(name: str, *, complex_schema: bool = False) -> dict:
     }
 
 
-def test_build_body_stubs_schemas_above_threshold():
-    """Large manifests get bare {type:object} stubs (skip grammar compile)."""
+def test_build_ollama_native_body_sanitizes_large_manifest():
+    """Large manifests get full sanitized schemas — no stubbing.
+
+    Regression: a prior count-based path blanked every tool's parameters to
+    {"type":"object"} above 32 tools, stripping all argument guidance. It also
+    did not fix the grammar-400 (the real cause is tool_calls.arguments shape,
+    not schemas). That path is gone; all manifests now go through the sanitizer,
+    which neutralizes offenders (additionalProperties objects -> bool, $defs
+    dropped) while keeping the real schema so the model can generate arguments.
+    """
     tools = [_make_tool(f"t{i}", complex_schema=True) for i in range(64)]
     body = _build_ollama_native_body(
         "gemma", [{"role": "user", "content": "hi"}], {"think": False, "tools": tools}
     )
-    # Threshold (32) exceeded → every tool schema stubbed to {type:object}
     for t in body["tools"]:
-        assert t["function"]["parameters"] == {"type": "object"}
-        # Name + description preserved (model still sees what each tool does)
-        assert t["function"]["name"]
-        assert t["function"]["description"]
-    # The complex-schema constructs that would have 400'd must be gone
-    assert "additionalProperties" not in body["tools"][0]["function"]["parameters"]
-    assert "$defs" not in body["tools"][0]["function"]["parameters"]
+        params = t["function"]["parameters"]
+        # Sanitized, NOT stubbed to a bare object.
+        assert params != {"type": "object"}
+        # Offending constructs neutralized.
+        assert params["additionalProperties"] is False
+        assert "$defs" not in params
+        # Real schema preserved so the model can generate correct arguments.
+        assert params["properties"]["x"] == {"type": "string"}
 
 
-def test_build_body_preserves_schemas_below_threshold():
-    """Small manifests still get full sanitized schemas (validation preserved)."""
-    tools = [_make_tool(f"t{i}", complex_schema=True) for i in range(8)]
-    body = _build_ollama_native_body(
-        "gemma", [{"role": "user", "content": "hi"}], {"think": False, "tools": tools}
-    )
-    # Threshold not exceeded → sanitizer still normalizes (additionalProperties
-    # → bool), but does NOT stub.
-    assert body["tools"][0]["function"]["parameters"]["additionalProperties"] is False
-    # Properties preserved (not stubbed to bare object)
-    assert body["tools"][0]["function"]["parameters"].get("properties", {}).get("x") == {
-        "type": "string"
-    }
+# --- tool_calls arguments: string -> object for Ollama native /api/chat ---
+# Ollama's /api/chat rejects prior assistant tool_calls whose
+# function.arguments is a JSON string (OpenAI shape) with the generic
+# "Value looks like object, but can't find closing '}' symbol" 400 — on every
+# multi-turn agentic conversation. The body builder parses them to objects.
+# This is the real root cause of the failing claude-local calls, not schemas.
 
 
-def test_stub_tool_schema_preserves_name_and_description():
-    from langfuse_openai_proxy.domain.services import _stub_tool_schema
+def test_ollama_native_messages_parses_tool_call_args_string_to_object():
+    from langfuse_openai_proxy.domain.services import _ollama_native_messages
 
-    tool = {
-        "type": "function",
-        "function": {
-            "name": "Bash",
-            "description": "run a command",
-            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "Bash", "arguments": '{"command": "ls"}'},
+                }
+            ],
+        }
+    ]
+    out = _ollama_native_messages(messages)
+    args = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert args == {"command": "ls"}
+    assert isinstance(args, dict)
+
+
+def test_ollama_native_messages_handles_empty_and_malformed_args():
+    from langfuse_openai_proxy.domain.services import _ollama_native_messages
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "X", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "Y", "arguments": ""}},
+                {"id": "c", "type": "function", "function": {"name": "Z", "arguments": "bad{"}},
+            ],
+        }
+    ]
+    out = _ollama_native_messages(messages)
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == {}
+    assert out[0]["tool_calls"][1]["function"]["arguments"] == {}
+    assert out[0]["tool_calls"][2]["function"]["arguments"] == {}  # malformed -> {}
+
+
+def test_ollama_native_messages_idempotent_on_objects_and_passes_other_msgs():
+    from langfuse_openai_proxy.domain.services import _ollama_native_messages
+
+    messages = [
+        {"role": "user", "content": "hi"},  # no tool_calls -> untouched
+        {"role": "tool", "tool_call_id": "x", "content": "result"},  # untouched
+        {
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [
+                {
+                    "id": "a",
+                    "type": "function",
+                    "function": {"name": "X", "arguments": {"already": "object"}},
+                }
+            ],
         },
-    }
-    out = _stub_tool_schema(tool)
-    assert out["function"]["name"] == "Bash"
-    assert out["function"]["description"] == "run a command"
-    assert out["function"]["parameters"] == {"type": "object"}
-    # Original tool not mutated
-    assert tool["function"]["parameters"] != {"type": "object"}
+    ]
+    out = _ollama_native_messages(messages)
+    assert out[0] == messages[0]
+    assert out[1] == messages[1]
+    # Object arguments pass through unchanged.
+    assert out[2]["tool_calls"][0]["function"]["arguments"] == {"already": "object"}
+
+
+def test_ollama_native_messages_does_not_mutate_input():
+    from langfuse_openai_proxy.domain.services import _ollama_native_messages
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "X", "arguments": '{"k": 1}'}}
+            ],
+        }
+    ]
+    _ollama_native_messages(messages)
+    # Original is still a string.
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"k": 1}'
+
+
+def test_build_ollama_native_body_parses_request_tool_call_args():
+    """End-to-end: the body builder converts prior assistant tool_calls args to
+    objects so Ollama /api/chat accepts multi-turn agentic conversations."""
+    body = _build_ollama_native_body(
+        "qwen-haiku:4b",
+        [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": '{"command":"echo hi"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "hi"},
+            {"role": "user", "content": "again"},
+        ],
+        {"think": False},
+    )
+    args = body["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    assert args == {"command": "echo hi"}
+    assert isinstance(args, dict)
 
 
 def test_tuple_items_collapsed_to_first():
