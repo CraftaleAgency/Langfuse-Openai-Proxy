@@ -526,8 +526,15 @@ async def openai_to_anthropic_stream(
             done, _pending = await asyncio.wait({next_task}, timeout=heartbeat_seconds)
             if done:
                 break
-            if state.message_started:
-                yield _sse("ping", {"type": "ping"})
+            # Emit a ping on EVERY heartbeat, including before message_start.
+            # During Ollama's prompt-eval phase a full Claude Code tool manifest
+            # can take >120s on a 12B, and the upstream yields nothing the whole
+            # time — so without these early keepalives no body byte reaches the
+            # client during eval, and a Cloudflare front-end 524s at its 120s
+            # read timeout. A ping every ~15s keeps that timer reset. Anthropic's
+            # real API pings before message_start too, so clients (Claude Code)
+            # tolerate a pre-start ping.
+            yield _sse("ping", {"type": "ping"})
         try:
             chunk = next_task.result()
         except StopAsyncIteration:

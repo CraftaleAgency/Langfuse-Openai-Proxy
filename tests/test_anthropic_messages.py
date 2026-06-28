@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -24,6 +25,7 @@ import pytest
 from langfuse_openai_proxy.api import anthropic_routes
 from langfuse_openai_proxy.api.app import create_app
 from langfuse_openai_proxy.api.dependencies import get_settings
+from langfuse_openai_proxy.domain.anthropic_translator import openai_to_anthropic_stream
 from langfuse_openai_proxy.domain.errors import UpstreamError
 from langfuse_openai_proxy.domain.models import ChatRequest, Credentials
 from langfuse_openai_proxy.infrastructure.config import Settings
@@ -634,6 +636,35 @@ async def test_streaming_tool_use_overrides_wrong_trailing_finish(client_factory
         assert md["delta"]["stop_reason"] == "tool_use"
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_emits_ping_before_message_start_on_slow_upstream():
+    """A ping must flow during prompt-eval silence (before message_start) so a
+    Cloudflare front-end doesn't 524 on a slow first chunk — the real failure
+    mode for a full-tool opus turn on a 12B."""
+    heartbeat = 0.04
+
+    async def slow_chunks():
+        # Simulate Ollama's prompt-eval silence before the first token.
+        await asyncio.sleep(heartbeat * 3)
+        yield {"choices": [{"delta": {"content": "hi"}, "finish_reason": None}]}
+        yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+    event_types: list[str] = []
+    async for evt in openai_to_anthropic_stream(
+        slow_chunks(),
+        original_model="claude-opus-4-5",
+        message_id="msg_heartbeat",
+        heartbeat_seconds=heartbeat,
+    ):
+        for line in evt.splitlines():
+            if line.startswith("event:"):
+                event_types.append(line[len("event:") :].strip())
+
+    assert event_types[0] == "ping", "first byte during eval silence must be a ping"
+    assert "message_start" in event_types
+    assert event_types.index("ping") < event_types.index("message_start")
 
 
 # --- count_tokens --------------------------------------------------------

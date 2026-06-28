@@ -10,6 +10,7 @@ env's LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY. This is a trusted
 single-client route — not multi-tenant like /v1/chat/completions.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -277,9 +278,15 @@ async def create_message(
                 # pending — and its `finally` block (which flushes the Langfuse
                 # trace) only runs when the generator is closed. Without this,
                 # completed streams never flush and traces silently go missing.
-                await translator.aclose()
-                await chunk_iter.aclose()
-                await openai_sse.aclose()
+                # Guard each aclose(): when the client disconnects mid-stream
+                # (e.g. a Cloudflare 524, or Claude Code cancelling), uvicorn
+                # cancels this ASGI task while a generator is still mid-yield,
+                # and aclose() then raises RuntimeError "asynchronous generator
+                # is already running" — a noisy traceback that masks the real
+                # (already-sent) status. Swallow it; the generators are exiting.
+                for _gen in (translator, chunk_iter, openai_sse):
+                    with contextlib.suppress(RuntimeError):
+                        await _gen.aclose()
                 if _SHIM_DEBUG:
                     logger.info(
                         "[shim] RESP %s blocks=%s stop=%s usage=%s",
