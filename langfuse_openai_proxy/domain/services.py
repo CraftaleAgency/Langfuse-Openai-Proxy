@@ -214,6 +214,48 @@ def _sanitize_tool_for_ollama(tool: Any) -> Any:
     return out
 
 
+# Above this tool-count threshold we replace each tool's parameter schema with
+# a bare ``{"type":"object"}`` stub before sending to Ollama. llama.cpp compiles
+# the full tool manifest into a single JSON grammar via json_schema_to_grammar;
+# for a 500+ tool Claude Code manifest (~345KB of schema) that compile is slow
+# AND flaky — one unsupported construct buried deep in the union produces a
+# malformed grammar that fails at sampling time with the generic
+# ``"Value looks like object, but can't find closing '}' symbol"`` 400.
+#
+# Dropping the parameter schema entirely sidesteps the compile:
+#   - The gemma4 / qwen agentic tunes emit tool calls as native ``call:Name{...}``
+#     text regardless of any declared schema (verified in Ollama logs and via
+#     /api/generate with raw=True).
+#   - Ollama's gemma4 parser converts that text into structured ``tool_calls``
+#     when ANY ``tools`` array is declared — the parameter schema is not consulted
+#     during parsing, only during grammar-constrained generation (which we just
+#     disabled by stubbing).
+# We still pass name + description so the model sees what each tool does, and we
+# keep the threshold low enough that ordinary (small) tool lists get full schemas
+# (preserving argument validation for normal clients).
+_TOOL_SCHEMA_STUB_THRESHOLD = 32
+
+
+def _stub_tool_schema(tool: Any) -> Any:
+    """Keep name + description but drop the parameter schema.
+
+    Returns a tool whose ``function.parameters`` is a bare ``{"type":"object"}``
+    so llama.cpp's json_schema_to_grammar compiles nothing per-tool. The model
+    still sees the tool's name and description, and the gemma4 parser still
+    produces structured tool_calls from the model's native ``call:Name{...}``
+    output.
+    """
+    if not isinstance(tool, dict):
+        return tool
+    out = dict(tool)
+    fn = out.get("function")
+    if isinstance(fn, dict):
+        fn = dict(fn)
+        fn["parameters"] = {"type": "object"}
+        out["function"] = fn
+    return out
+
+
 def _build_ollama_native_body(model: str, messages: list, extra_params: dict) -> dict:
     """Translate an OpenAI chat request to Ollama's native /api/chat format."""
     body: dict = {
@@ -248,10 +290,24 @@ def _build_ollama_native_body(model: str, messages: list, extra_params: dict) ->
         if k in extra_params:
             value = extra_params[k]
             if k == "tools" and isinstance(value, list):
-                # Normalize each tool's parameter schema to Ollama's JSON-Schema
-                # subset — otherwise one unsupported construct in a 500+ tool
-                # manifest 400s the whole request. See _sanitize_json_schema.
-                value = [_sanitize_tool_for_ollama(t) for t in value]
+                if len(value) > _TOOL_SCHEMA_STUB_THRESHOLD:
+                    # Large manifest (e.g. Claude Code's 564 tools). Compiling
+                    # the full 345KB schema into a JSON grammar is slow and
+                    # flaky — one buried construct emits a malformed grammar that
+                    # 400s at sampling time. Stub the parameter schemas (keep
+                    # name + description); the gemma4 parser still converts the
+                    # model's native call:Name{...} output into structured
+                    # tool_calls. See _stub_tool_schema.
+                    value = [_stub_tool_schema(t) for t in value]
+                    logger.info(
+                        "[ollama] stubbed %d tool schemas (threshold=%d) to "
+                        "skip json_schema_to_grammar compile",
+                        len(value),
+                        _TOOL_SCHEMA_STUB_THRESHOLD,
+                    )
+                else:
+                    # Small manifest — normalize each schema to Ollama's subset.
+                    value = [_sanitize_tool_for_ollama(t) for t in value]
             body[k] = value
 
     return body

@@ -127,6 +127,74 @@ def test_build_ollama_native_body_sanitizes_tools():
     assert body["think"] is False
 
 
+def _make_tool(name: str, *, complex_schema: bool = False) -> dict:
+    params = (
+        {
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "additionalProperties": {"type": "string"},
+            "$defs": {"Foo": {"type": "object"}},
+        }
+        if complex_schema
+        else {"type": "object", "properties": {"x": {"type": "string"}}}
+    )
+    return {
+        "type": "function",
+        "function": {"name": name, "description": f"tool {name}", "parameters": params},
+    }
+
+
+def test_build_body_stubs_schemas_above_threshold():
+    """Large manifests get bare {type:object} stubs (skip grammar compile)."""
+    tools = [_make_tool(f"t{i}", complex_schema=True) for i in range(64)]
+    body = _build_ollama_native_body(
+        "gemma", [{"role": "user", "content": "hi"}], {"think": False, "tools": tools}
+    )
+    # Threshold (32) exceeded → every tool schema stubbed to {type:object}
+    for t in body["tools"]:
+        assert t["function"]["parameters"] == {"type": "object"}
+        # Name + description preserved (model still sees what each tool does)
+        assert t["function"]["name"]
+        assert t["function"]["description"]
+    # The complex-schema constructs that would have 400'd must be gone
+    assert "additionalProperties" not in body["tools"][0]["function"]["parameters"]
+    assert "$defs" not in body["tools"][0]["function"]["parameters"]
+
+
+def test_build_body_preserves_schemas_below_threshold():
+    """Small manifests still get full sanitized schemas (validation preserved)."""
+    tools = [_make_tool(f"t{i}", complex_schema=True) for i in range(8)]
+    body = _build_ollama_native_body(
+        "gemma", [{"role": "user", "content": "hi"}], {"think": False, "tools": tools}
+    )
+    # Threshold not exceeded → sanitizer still normalizes (additionalProperties
+    # → bool), but does NOT stub.
+    assert body["tools"][0]["function"]["parameters"]["additionalProperties"] is False
+    # Properties preserved (not stubbed to bare object)
+    assert body["tools"][0]["function"]["parameters"].get("properties", {}).get("x") == {
+        "type": "string"
+    }
+
+
+def test_stub_tool_schema_preserves_name_and_description():
+    from langfuse_openai_proxy.domain.services import _stub_tool_schema
+
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "description": "run a command",
+            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+        },
+    }
+    out = _stub_tool_schema(tool)
+    assert out["function"]["name"] == "Bash"
+    assert out["function"]["description"] == "run a command"
+    assert out["function"]["parameters"] == {"type": "object"}
+    # Original tool not mutated
+    assert tool["function"]["parameters"] != {"type": "object"}
+
+
 def test_tuple_items_collapsed_to_first():
     # JSON-Schema tuple validation (items as a list) isn't supported by llama.cpp.
     schema = {"type": "array", "items": [{"type": "string"}, {"type": "number"}]}
