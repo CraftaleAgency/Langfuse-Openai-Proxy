@@ -345,6 +345,28 @@ def _anthropic_err_type(status_code: int) -> str:
     return "invalid_request_error"
 
 
+# Ollama (llama.cpp) intermittently 400s a tool-bearing /api/chat with a
+# malformed-grammar message even though the schema is valid — a grammar-cache
+# bug. The same payload succeeds ~100% on retry (verified: the captured
+# failing dump replayed 200 on 12/12 clean attempts), so we transparently retry
+# only this specific error. Genuine schema/auth/model 400s still surface.
+_OLLAMA_GRAMMAR_RETRIES = 3
+_GRAMMAR_400_MARKERS = (
+    "can't find closing",
+    "closing '}'",
+    "expected a '}'",
+    "not a valid grammar",
+)
+
+
+def _is_transient_grammar_400(status_code: int, err_text: str) -> bool:
+    """True only for Ollama's intermittent json_schema_to_grammar failure."""
+    if status_code != 400:
+        return False
+    low = (err_text or "").lower()
+    return any(marker in low for marker in _GRAMMAR_400_MARKERS)
+
+
 def _apply_max_tokens_floor(extra_params: dict | None, floor: int | None) -> dict:
     """Inject or raise `max_tokens` so reasoning models don't get starved.
 
@@ -567,31 +589,49 @@ class TracingService:
         )
         body["stream"] = False
 
-        try:
-            resp = await http.post(url, headers=headers, json=body, timeout=600)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            # Preserve the upstream status (4xx/5xx) rather than flattening to 502.
-            # Read Ollama's error body — str(e) alone is just "400 Bad Request"
-            # and hides the real cause (e.g. a tool schema Ollama rejects).
-            err_text = ""
-            with contextlib.suppress(Exception):
-                err_text = e.response.text.strip()[:1000]
-            logger.error(
-                "[ollama] /api/chat %s: %s | model=%s tools=%d msgs=%d",
-                e.response.status_code,
-                err_text,
-                request.model,
-                len(body.get("tools") or []),
-                len(request.messages),
-            )
-            raise UpstreamError(
-                f"ollama /api/chat {e.response.status_code}: {err_text}",
-                status_code=e.response.status_code,
-            ) from e
-        except httpx.TransportError as e:
-            # Connection / timeout — no upstream response to forward.
-            raise UpstreamError("Ollama native endpoint unreachable") from e
+        resp = None
+        for attempt in range(_OLLAMA_GRAMMAR_RETRIES):
+            try:
+                resp = await http.post(url, headers=headers, json=body, timeout=600)
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as e:
+                # Preserve the upstream status (4xx/5xx) rather than flattening to 502.
+                # Read Ollama's error body — str(e) alone is just "400 Bad Request"
+                # and hides the real cause (e.g. a tool schema Ollama rejects).
+                err_text = ""
+                with contextlib.suppress(Exception):
+                    err_text = e.response.text.strip()[:1000]
+                # Retry the intermittent llama.cpp grammar-cache 400 (same payload
+                # succeeds ~100% on retry); only on the final attempt do we log the
+                # real error and surface it. Non-transient 4xx/5xx surface at once.
+                if (
+                    _is_transient_grammar_400(e.response.status_code, err_text)
+                    and attempt < _OLLAMA_GRAMMAR_RETRIES - 1
+                ):
+                    logger.warning(
+                        "[ollama] transient grammar 400, retry %d/%d | model=%s tools=%d",
+                        attempt + 1,
+                        _OLLAMA_GRAMMAR_RETRIES,
+                        request.model,
+                        len(body.get("tools") or []),
+                    )
+                    continue
+                logger.error(
+                    "[ollama] /api/chat %s: %s | model=%s tools=%d msgs=%d",
+                    e.response.status_code,
+                    err_text,
+                    request.model,
+                    len(body.get("tools") or []),
+                    len(request.messages),
+                )
+                raise UpstreamError(
+                    f"ollama /api/chat {e.response.status_code}: {err_text}",
+                    status_code=e.response.status_code,
+                ) from e
+            except httpx.TransportError as e:
+                # Connection / timeout — no upstream response to forward.
+                raise UpstreamError("Ollama native endpoint unreachable") from e
 
         payload = resp.json()
         return _ollama_native_to_openai(request.model, payload)
@@ -614,91 +654,140 @@ class TracingService:
         completion_id = f"chatcmpl-ollama-{int(time.time() * 1000)}"
 
         try:
-            async with http.stream("POST", url, headers=headers, json=body, timeout=600) as resp:
-                if resp.status_code >= 400:
-                    # Read Ollama's error body BEFORE the stream context closes and
-                    # discards it. raise_for_status() would yield only a generic
-                    # "400 Bad Request" (hiding the real cause, e.g. a rejected tool
-                    # schema) AND raise an unhandled HTTPStatusError that crashes the
-                    # ASGI app once the 200/SSE headers are committed. Instead: log
-                    # the verbatim upstream error and end the stream with an error
-                    # frame so the client sees a clean error, not a broken stream.
-                    err_bytes = await resp.aread()
-                    err_text = err_bytes.decode(errors="replace").strip()[:1000]
-                    logger.error(
-                        "[ollama] /api/chat %s: %s | model=%s tools=%d msgs=%d",
-                        resp.status_code,
-                        err_text,
-                        request.model,
-                        len(body.get("tools") or []),
-                        len(request.messages),
-                    )
-                    # Debug aid: persist the (sanitized) tools payload Ollama
-                    # rejected so the offending schema can be located offline.
-                    # Best-effort — never let a dump failure mask the real error.
-                    with (
-                        contextlib.suppress(Exception),
-                        open(f"/tmp/ollama_bad_tools_{int(time.time())}.json", "w") as f,
-                    ):
-                        json.dump(body.get("tools") or [], f)
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            {
-                                "error": {
-                                    "type": _anthropic_err_type(resp.status_code),
-                                    "message": (f"ollama /api/chat {resp.status_code}: {err_text}"),
-                                }
-                            }
+            # Open the stream, retrying Ollama's intermittent grammar-cache 400
+            # (see _is_transient_grammar_400). The retry runs before any byte is
+            # yielded, so it's transparent — StreamingResponse has already
+            # committed 200 headers, which is fine (the client expects a stream).
+            for attempt in range(_OLLAMA_GRAMMAR_RETRIES):
+                async with http.stream(
+                    "POST", url, headers=headers, json=body, timeout=600
+                ) as resp:
+                    if resp.status_code >= 400:
+                        # Read Ollama's error body BEFORE the stream context closes.
+                        err_bytes = await resp.aread()
+                        err_text = err_bytes.decode(errors="replace").strip()[:1000]
+                        if (
+                            _is_transient_grammar_400(resp.status_code, err_text)
+                            and attempt < _OLLAMA_GRAMMAR_RETRIES - 1
+                        ):
+                            logger.warning(
+                                "[ollama] transient grammar 400, retry %d/%d | model=%s tools=%d",
+                                attempt + 1,
+                                _OLLAMA_GRAMMAR_RETRIES,
+                                request.model,
+                                len(body.get("tools") or []),
+                            )
+                            continue  # exits async with (closes resp), retries the for-loop
+                        # Not transient, or retries exhausted: log the verbatim
+                        # upstream error, dump the rejected tools for offline
+                        # diagnosis, and end the stream with an error frame so the
+                        # client sees a clean error, not a broken stream.
+                        logger.error(
+                            "[ollama] /api/chat %s: %s | model=%s tools=%d msgs=%d",
+                            resp.status_code,
+                            err_text,
+                            request.model,
+                            len(body.get("tools") or []),
+                            len(request.messages),
                         )
-                        + "\n\n"
-                    )
-                    return
-                async for line in resp.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = chunk.get("message", {}) or {}
-                    content = msg.get("content", "") or ""
-                    reasoning = msg.get("reasoning", "") or ""
-                    tool_calls = msg.get("tool_calls") or []
-                    if not content and reasoning and self._reasoning_as_content:
-                        content = reasoning
-
-                    finish = None
-                    if chunk.get("done"):
-                        dr = chunk.get("done_reason")
-                        if dr == "length":
-                            finish = "length"
-                        elif dr == "tool_calls" or tool_calls:
-                            finish = "tool_calls"
-                        else:
-                            finish = "stop"
-
-                    # Tool calls: Ollama emits them on message.tool_calls with
-                    # empty content. Translate to OpenAI delta.tool_calls so the
-                    # Anthropic translator can emit tool_use blocks. Without this
-                    # the native stream path silently drops every tool call
-                    # (the empty-content branch below used to `continue` past them).
-                    if tool_calls:
-                        tc_deltas = []
-                        for i, tc in enumerate(tool_calls):
-                            fn = tc.get("function") or {}
-                            tc_deltas.append(
+                        with (
+                            contextlib.suppress(Exception),
+                            open(f"/tmp/ollama_bad_tools_{int(time.time())}.json", "w") as f,
+                        ):
+                            json.dump(body.get("tools") or [], f)
+                        yield (
+                            "data: "
+                            + json.dumps(
                                 {
-                                    "index": i,
-                                    "id": tc.get("id") or f"call_{i}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": fn.get("name", ""),
-                                        "arguments": _tool_args_to_str(fn.get("arguments")),
-                                    },
+                                    "error": {
+                                        "type": _anthropic_err_type(resp.status_code),
+                                        "message": (
+                                            f"ollama /api/chat {resp.status_code}: {err_text}"
+                                        ),
+                                    }
                                 }
                             )
+                            + "\n\n"
+                        )
+                        return
+                    async for line in resp.aiter_lines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        msg = chunk.get("message", {}) or {}
+                        content = msg.get("content", "") or ""
+                        reasoning = msg.get("reasoning", "") or ""
+                        tool_calls = msg.get("tool_calls") or []
+                        if not content and reasoning and self._reasoning_as_content:
+                            content = reasoning
+
+                        finish = None
+                        if chunk.get("done"):
+                            dr = chunk.get("done_reason")
+                            if dr == "length":
+                                finish = "length"
+                            elif dr == "tool_calls" or tool_calls:
+                                finish = "tool_calls"
+                            else:
+                                finish = "stop"
+
+                        # Tool calls: Ollama emits them on message.tool_calls with
+                        # empty content. Translate to OpenAI delta.tool_calls so the
+                        # Anthropic translator can emit tool_use blocks. Without this
+                        # the native stream path silently drops every tool call.
+                        if tool_calls:
+                            tc_deltas = []
+                            for i, tc in enumerate(tool_calls):
+                                fn = tc.get("function") or {}
+                                tc_deltas.append(
+                                    {
+                                        "index": i,
+                                        "id": tc.get("id") or f"call_{i}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": fn.get("name", ""),
+                                            "arguments": _tool_args_to_str(fn.get("arguments")),
+                                        },
+                                    }
+                                )
+                            data = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": request.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"tool_calls": tc_deltas},
+                                        "finish_reason": finish,
+                                    }
+                                ],
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                            if chunk.get("done"):
+                                break
+                            continue
+
+                        if not content and not reasoning:
+                            # Keep-alive or mid-stream empty delta; skip unless final.
+                            if chunk.get("done"):
+                                if finish is not None:
+                                    data = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": request.model,
+                                        "choices": [
+                                            {"index": 0, "delta": {}, "finish_reason": finish}
+                                        ],
+                                    }
+                                    yield f"data: {json.dumps(data)}\n\n"
+                                break
+                            continue
                         data = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -707,7 +796,7 @@ class TracingService:
                             "choices": [
                                 {
                                     "index": 0,
-                                    "delta": {"tool_calls": tc_deltas},
+                                    "delta": {"content": content} if content else {},
                                     "finish_reason": finish,
                                 }
                             ],
@@ -715,38 +804,7 @@ class TracingService:
                         yield f"data: {json.dumps(data)}\n\n"
                         if chunk.get("done"):
                             break
-                        continue
-
-                    if not content and not reasoning:
-                        # Keep-alive or mid-stream empty delta; skip unless final.
-                        if chunk.get("done"):
-                            if finish is not None:
-                                data = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created,
-                                    "model": request.model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
-                                }
-                                yield f"data: {json.dumps(data)}\n\n"
-                            break
-                        continue
-                    data = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": request.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {"content": content} if content else {},
-                                "finish_reason": finish,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(data)}\n\n"
-                    if chunk.get("done"):
-                        break
+                    break  # stream finished normally — exit the retry loop
         except httpx.TransportError:
             # Connection failed before/while streaming. Emit an SSE error frame
             # (StreamingResponse has already committed 200 headers by the time a
