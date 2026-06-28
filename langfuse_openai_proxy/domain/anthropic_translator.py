@@ -686,6 +686,14 @@ async def openai_to_anthropic_stream(
             blk["closed"] = True
 
     stop_reason = _FINISH_TO_STOP.get(state.finish_reason or "stop", "end_turn")
+    # If any tool_use block was emitted, the stop reason MUST be tool_use — even
+    # when Ollama's trailing `done` chunk reports done_reason="stop" on a
+    # separate chunk AFTER the tool_call chunk (gemma splits them, so the final
+    # finish_reason lands on "stop"). Claude Code gates tool execution on
+    # stop_reason=="tool_use"; an "end_turn" here makes it treat the turn as
+    # complete and silently never run the tool.
+    if any(blk["type"] == "tool_use" for blk in state.open_blocks.values()):
+        stop_reason = "tool_use"
     # Prefer real usage from the upstream's final chunk; fall back to a
     # char-based estimate. Ollama's OpenAI-compat stream frequently omits a
     # terminal usage chunk, and reporting output_tokens=0 makes clients like

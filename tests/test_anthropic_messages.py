@@ -164,6 +164,42 @@ class FakeTracingService:
                     "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10},
                 },
             ]
+        elif self.behavior == "stream_tool_use_split_done":
+            # gemma-style: the tool_call arrives in its own chunk, then a
+            # SEPARATE trailing `done` chunk carries finish_reason="stop" (NOT
+            # "tool_calls"). The translator must still report tool_use.
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_split",
+                                        "function": {"name": "get_weather", "arguments": ""},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {"index": 0, "function": {"arguments": '{"city":"Paris"}'}}
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                },
+                # Trailing done chunk with the WRONG finish — must be overridden.
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ]
         elif self.behavior == "stream_tool_use":
             chunks = [
                 {
@@ -565,6 +601,36 @@ async def test_streaming_tool_use_input_json_delta(client_factory):
         assert "".join(json_deltas) == '{"city":"Boston"}'
         # Stop reason must be tool_use.
         md = [e for et, e in events if et == "message_delta"][0]
+        assert md["delta"]["stop_reason"] == "tool_use"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streaming_tool_use_overrides_wrong_trailing_finish(client_factory):
+    """When the tool_call chunk and the trailing done chunk are split, Ollama
+    reports finish_reason="stop" on the done chunk. The translator must still
+    emit stop_reason="tool_use" (Claude Code gates tool execution on it)."""
+    settings = _make_settings()
+    client, _ = client_factory(settings, behavior="stream_tool_use_split_done")
+    try:
+        resp = await client.post(
+            "/v1/messages",
+            headers={"x-api-key": SECRET, "content-type": "application/json"},
+            json=_msg_body(stream=True),
+        )
+        assert resp.status_code == 200
+        events = await _read_sse_stream(resp)
+        tool_starts = [
+            e
+            for et, e in events
+            if et == "content_block_start" and e["content_block"]["type"] == "tool_use"
+        ]
+        assert len(tool_starts) == 1
+        assert tool_starts[0]["content_block"]["name"] == "get_weather"
+        md = [e for et, e in events if et == "message_delta"][0]
+        # The override: tool_use block present => stop_reason must be tool_use,
+        # NOT the "end_turn" the trailing finish_reason="stop" would imply.
         assert md["delta"]["stop_reason"] == "tool_use"
     finally:
         await client.aclose()
